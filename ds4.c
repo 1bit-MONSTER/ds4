@@ -2755,6 +2755,8 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
+#include "ds4_onebp.inc"  /* 1bit-MONSTER: the 1BP v5 reader */
+
 /* Engram is deliberately outside the weight mapping, not merely absent from
  * a residency list. Startup warming and any future weight-view code must not
  * turn its 189 GiB of random-access rows into a resident model allocation. */
@@ -2889,15 +2891,19 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
     if (!cursor_u32(&c, &magic)) ds4_die(c.error);
-    if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
-    if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
-    if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+    if (magic == DS4_ONEBP_MAGIC) {
+        model_open_onebp(m, &c);  /* 1bit-MONSTER: 1BP v5 (ds4_onebp.inc) */
+    } else {
+        if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+        if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
+        if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
+        if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
 
-    if (m->version != 3) ds4_die("only GGUF v3 is supported");
+        if (m->version != 3) ds4_die("only GGUF v3 is supported");
 
-    parse_metadata(m, &c);
-    parse_tensors(m, &c);
+        parse_metadata(m, &c);
+        parse_tensors(m, &c);
+    }
     model_unmap_engram(m);
     model_unmap_qwen_ngrams(m, path);
 
