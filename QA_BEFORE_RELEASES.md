@@ -1931,6 +1931,11 @@ batching. The native batching requirements below apply to V4.1.
   `tests/test_tp_link`, `tests/test_cuda_tp` and `tests/test_cuda_ssd_batch`.
   Run the command/TCP/RDMA unit tests under ASAN/UBSAN. Tiny socket buffers,
   stalled peers, half-close and disconnect must fail promptly, not deadlock.
+  Inject one-sided head-row and verify-window failures. A failed context
+  must refuse subsequent commands and gates without touching the transport;
+  recovery requires a new connection, not a replay on the failed link.
+  Repeat the physical link test with `DS4_TEST_TP_HEAD_ROW_FAULT=1` on both
+  peers to check that a rejected head row sends no replay or decode command.
 - Run the physical link test in both directions on each available direct
   link, with TCP and RDMA. Check the reported device, RoCEv2 GID and RC
   transport. A management-network ping is not an RDMA test. Stop a worker

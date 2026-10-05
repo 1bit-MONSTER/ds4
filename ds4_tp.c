@@ -534,14 +534,20 @@ static int tp_mbox_get(ds4_tp *tp, uint32_t *type, uint8_t **payload, uint32_t *
  * ring marker and then the frame on the TCP control channel, so the worker
  * still takes commands strictly in order. */
 static int tp_send_command(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
+    int ok;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp_mbox_active(tp)) {
         if (bytes <= DS4_TP_MBOX_SEQ_OFF - sizeof(ds4_tp_frame_header))
-            return tp_mbox_put(tp, type, payload, bytes);
-        if (!tp_mbox_put(tp, DS4_TP_MBOX_FRAME_TCP, NULL, 0)) return 0;
-    }
+            ok = tp_mbox_put(tp, type, payload, bytes);
+        else
+            ok = tp_mbox_put(tp, DS4_TP_MBOX_FRAME_TCP, NULL, 0) &&
+                 tp_send_frame(tp->control_fd, type, payload, bytes);
+    } else
 #endif
-    return tp_send_frame(tp->control_fd, type, payload, bytes);
+        ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
 }
 
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
@@ -2586,6 +2592,7 @@ void ds4_tp_mark_failed(ds4_tp *tp) {
  * --------------------------------------------------------------------- */
 
 int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) return tp_rdma_gate_exchange(tp, layer, gate, seq);
 #endif
@@ -2626,8 +2633,11 @@ int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
         return 0;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma *r = &tp->rdma;
-    if (r->block_active) return 0;
-    if (tp->rdma_active && !tp_rdma_drain_decode_window(tp)) return 0;
+    if (r->block_active ||
+        (tp->rdma_active && !tp_rdma_drain_decode_window(tp))) {
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
     const bool window = tp->rdma_active && tp_rdma_big_gate_capable(tp) &&
                         !getenv("DS4_TP_DISABLE_VERIFY_WINDOW");
     if (window) {
@@ -2639,7 +2649,11 @@ int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
         r->block_recv_done = 0;
         const int ok = tp_rdma_block_post_layer(tp, 0);
         pthread_mutex_unlock(&r->post_lock);
-        if (!ok) { r->block_active = false; return 0; }
+        if (!ok) {
+            r->block_active = false;
+            ds4_tp_mark_failed(tp);
+            return 0;
+        }
     }
 #endif
     /* Posting slot zero does not depend on the selected gate count. This
@@ -2676,6 +2690,7 @@ int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
 /* End of the verify block: every gate must have been exchanged (all
  * posted receives consumed) and our signaled sends reaped. */
 int ds4_tp_batch_block_end(ds4_tp *tp) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     ds4_tp_rdma *r = &tp->rdma;
     if (!r->block_active) return 1;
@@ -2695,6 +2710,7 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
         fprintf(stderr, "ds4-tp: verify window closed: %llu/%llu rows, ok=%d\n",
                 (unsigned long long)r->block_recv_done, (unsigned long long)want, ok);
     r->block_active = false;
+    if (!ok) ds4_tp_mark_failed(tp);
     return ok;
 #else
     (void)tp;
@@ -2704,6 +2720,7 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
 
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS ||
         layer >= tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
@@ -2752,6 +2769,7 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 /* Prefill batch gate: RDMA uses the pipelined registered-slab path above. */
 int ds4_tp_big_gate_exchange(ds4_tp *tp, uint32_t layer, uint64_t seq,
                              const void *out, void *in, uint64_t bytes) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
     if (tp->data_fd < 0 || !out || !in || bytes == 0) return 0;
 #ifdef DS4_TP_HAVE_VERBS
     static int dbg = -1;

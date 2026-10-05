@@ -369,17 +369,36 @@ int main(int argc, char **argv) {
              * rolls back without reading the row; phase 2 must then get its
              * own row, never phase 1's. */
             const uint32_t floats = 64640u, row = phase + 2u, epoch = phase * 10000u + 500u;
+            const bool bad_row = phase == 0 && getenv("DS4_TEST_TP_HEAD_ROW_FAULT");
             const double h0 = now();
             if (rank == 1) {
                 float *buf = ds4_tp_head_row_out(tp);
                 CHECK(buf != NULL);
                 fill(buf, floats, 1u, epoch);
-                CHECK(ds4_tp_head_row_send(tp, row, floats));
+                CHECK(ds4_tp_head_row_send(tp, row + (bad_row ? 1u : 0u), floats));
             } else if (phase != 1) {
                 if (phase == 2) usleep(20000);   /* phase 1's row is long in place */
                 memset(in, 0, floats * sizeof(float));
-                CHECK(ds4_tp_head_row_recv(tp, row, in, floats));
-                CHECK(equal(in, floats, 1u, epoch));
+                const int received = ds4_tp_head_row_recv(tp, row, in, floats);
+                if (bad_row) {
+                    CHECK(!received && ds4_tp_failed(tp));
+                    CHECK(!ds4_tp_send_verify_commit(tp, DS4_TP_VERIFY_ROLLBACK_REPLAY, 1));
+                    CHECK(!ds4_tp_send_eval(tp, 1, seq, 7));
+                    CHECK(!ds4_tp_gate_exchange(tp, 0, 0, ++seq));
+                    CHECK(!ds4_tp_batch_block_begin(tp, small_rows, 40));
+                } else {
+                    CHECK(received && equal(in, floats, 1u, epoch));
+                }
+            }
+            if (bad_row) {
+                if (rank == 1) {
+                    ds4_tp_command command;
+                    CHECK(!ds4_tp_recv_command(tp, &command, error, sizeof(error)));
+                    ds4_tp_command_free(&command);
+                }
+                fprintf(stderr, "rank=%d one-sided head failure refuses replay/decode and closes peer: PASS\n", rank);
+                rc = 0;
+                goto done;
             }
             fprintf(stderr, "rank=%d phase=%u head row %u x %u floats %s %.1f us: PASS\n",
                     rank, phase, row, floats,
