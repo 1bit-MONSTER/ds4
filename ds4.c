@@ -71314,8 +71314,10 @@ static bool tp_dspark_split_eligible(const ds4_engine *e, bool leader, bool rdma
         const ds4_layer_weights *l = &dw->stage[s].block;
         const ds4_tensor *g = l->ffn_gate_exps, *u = l->ffn_up_exps, *d = l->ffn_down_exps;
         if (!g || !u || !d || g->ndim != 3 || u->ndim != 3 || d->ndim != 3 ||
-            g->type != DS4_TENSOR_IQ2_XXS || u->type != DS4_TENSOR_IQ2_XXS ||
-            d->type != DS4_TENSOR_Q2_K ||
+            !((g->type == DS4_TENSOR_IQ2_XXS && u->type == DS4_TENSOR_IQ2_XXS &&
+               d->type == DS4_TENSOR_Q2_K) ||
+              (g->type == DS4_TENSOR_MXFP4 && u->type == DS4_TENSOR_MXFP4 &&
+               d->type == DS4_TENSOR_MXFP4)) ||
             g->dim[0] != DS4_N_EMBD || g->dim[1] != 2048u || g->dim[2] != 256u ||
             u->dim[0] != g->dim[0] || u->dim[1] != g->dim[1] || u->dim[2] != g->dim[2] ||
             d->dim[0] != g->dim[1] || d->dim[1] != DS4_N_EMBD || d->dim[2] != g->dim[2] ||

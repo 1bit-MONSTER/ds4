@@ -1,4 +1,4 @@
-/* Lockstep TP drafter: intermediate split of the DSpark IQ2_XXS/Q2_K experts.
+/* Lockstep TP drafter: intermediate split of IQ2_XXS/Q2_K or native MXFP4.
  *
  * Production drafter shapes (in 4096, mid 2048, out 4096, 256 experts, top 6),
  * so the fused vector path the drafter uses is the one under test.
@@ -15,7 +15,8 @@
  *  - y0 + y1 matches the reference within float summation-order error;
  *  - with sharding suspended, or with no TP rank bound, the split is ignored
  *    and the call returns the reference bit for bit (leader-local drafter);
- *  - widths outside the vector path fail instead of reading raw experts;
+ *  - unsupported IQ2 widths fail instead of reading raw experts; MXFP4 also
+ *    covers one row and the larger-batch dispatch;
  *  - malformed descriptors build nothing; a rebuild after them is complete;
  *  - no NaN/Inf anywhere. */
 #include "ds4_gpu.h"
@@ -34,26 +35,34 @@
 
 enum { IN_DIM = 4096, MID_DIM = 2048, OUT_DIM = 4096, N_EXP = 256, TOPK = 6 };
 enum { IQ2_BYTES = 66, Q2K_BYTES = 84, QK = 256 };
+static bool mx;
 
 static uint32_t g_seed = 0x5eedu;
 static uint32_t rnd(void) { g_seed = g_seed * 1664525u + 1013904223u; return g_seed; }
 static float frand(void) { return (float)((int32_t)(rnd() >> 8) - (1 << 23)) / (float)(1 << 23); }
 
+static void fill_mxfp4(unsigned char *p, uint64_t blocks) {
+    for (uint64_t b = 0; b < blocks; b++, p += 17) {
+        p[0] = 116u + ((rnd() >> 24) % 5u);
+        for (int i = 1; i < 17; i++) p[i] = (unsigned char)(rnd() >> 24);
+    }
+}
+
 /* IQ2_XXS: fp16 d, then 64 bytes of grid indices, signs and scales. */
 static void fill_iq2_xxs(unsigned char *p, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++, p += IQ2_BYTES) {
-        const uint16_t d = (uint16_t)(0x1c00u + (rnd() & 0x3ffu));   /* 2^-8 .. 2^-7 */
+        const uint16_t d = (uint16_t)(0x1c00u + ((rnd() >> 16) & 0x3ffu));   /* 2^-8 .. 2^-7 */
         memcpy(p, &d, 2);
-        for (int i = 2; i < IQ2_BYTES; i++) p[i] = (unsigned char)rnd();
+        for (int i = 2; i < IQ2_BYTES; i++) p[i] = (unsigned char)(rnd() >> 24);
     }
 }
 
 /* Q2_K: 16 scale bytes, 64 quant bytes, fp16 d, fp16 dmin. */
 static void fill_q2_k(unsigned char *p, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++, p += Q2K_BYTES) {
-        for (int i = 0; i < 80; i++) p[i] = (unsigned char)rnd();
-        const uint16_t d = (uint16_t)(0x1c00u + (rnd() & 0x3ffu));
-        const uint16_t dmin = (uint16_t)(0x1800u + (rnd() & 0x3ffu));
+        for (int i = 0; i < 80; i++) p[i] = (unsigned char)(rnd() >> 24);
+        const uint16_t d = (uint16_t)(0x1c00u + ((rnd() >> 16) & 0x3ffu));
+        const uint16_t dmin = (uint16_t)(0x1800u + ((rnd() >> 16) & 0x3ffu));
         memcpy(p + 80, &d, 2);
         memcpy(p + 82, &dmin, 2);
     }
@@ -90,7 +99,7 @@ static int run_moe(const model_t *m, uint32_t n_tokens, const int32_t *ids, cons
     bool mid_is_f16 = false;
     int ok = ds4_gpu_routed_moe_batch_tensor(t_out, t_gate, t_up, t_mid, t_down,
                                              m->map, m->size, m->gate_off, m->up_off, m->down_off,
-                                             16u, 10u, m->gate_expert, m->gate_row,
+                                             mx ? 39u : 16u, mx ? 39u : 10u, m->gate_expert, m->gate_row,
                                              m->down_expert, m->down_row,
                                              IN_DIM, MID_DIM, OUT_DIM, t_ids, t_w,
                                              N_EXP, TOPK, 10.0f, t_x, 0u, n_tokens,
@@ -115,12 +124,14 @@ static uint64_t build_split(const model_t *m, uint32_t rank, const uint32_t *typ
                                          is_down, in_dims, out_dims, n_experts, types, 3);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    CHECK(argc == 1 || (argc == 2 && !strcmp(argv[1], "--mxfp4")));
+    mx = argc == 2;
     model_t m;
     memset(&m, 0, sizeof(m));
-    m.gate_row = (IN_DIM / QK) * IQ2_BYTES;
+    m.gate_row = mx ? (IN_DIM / 32u) * 17u : (IN_DIM / QK) * IQ2_BYTES;
     m.gate_expert = (uint64_t)MID_DIM * m.gate_row;
-    m.down_row = (MID_DIM / QK) * Q2K_BYTES;
+    m.down_row = mx ? (MID_DIM / 32u) * 17u : (MID_DIM / QK) * Q2K_BYTES;
     m.down_expert = (uint64_t)OUT_DIM * m.down_row;
     m.gate_off = 4096;
     m.up_off = m.gate_off + ((N_EXP * m.gate_expert + 4095u) & ~4095ull);
@@ -128,9 +139,20 @@ int main(void) {
     m.size = m.down_off + N_EXP * m.down_expert + 4096u;
     m.map = calloc(1, (size_t)m.size);
     CHECK(m.map);
-    fill_iq2_xxs(m.map + m.gate_off, N_EXP * m.gate_expert / IQ2_BYTES);
-    fill_iq2_xxs(m.map + m.up_off, N_EXP * m.gate_expert / IQ2_BYTES);
-    fill_q2_k(m.map + m.down_off, N_EXP * m.down_expert / Q2K_BYTES);
+    if (mx) {
+        fill_mxfp4(m.map + m.gate_off, N_EXP * m.gate_expert / 17u);
+        fill_mxfp4(m.map + m.up_off, N_EXP * m.gate_expert / 17u);
+        fill_mxfp4(m.map + m.down_off, N_EXP * m.down_expert / 17u);
+    } else {
+        fill_iq2_xxs(m.map + m.gate_off, N_EXP * m.gate_expert / IQ2_BYTES);
+        fill_iq2_xxs(m.map + m.up_off, N_EXP * m.gate_expert / IQ2_BYTES);
+        fill_q2_k(m.map + m.down_off, N_EXP * m.down_expert / Q2K_BYTES);
+    }
+    /* Low LCG bits repeat at these expert strides and can hide bad IDs. */
+    for (uint32_t e = 1; e < N_EXP; e++) {
+        CHECK(memcmp(m.map + m.gate_off, m.map + m.gate_off + e * m.gate_expert, 1024));
+        CHECK(memcmp(m.map + m.down_off, m.map + m.down_off + e * m.down_expert, 1024));
+    }
     strcpy(m.path, "/tmp/ds4-dspark-tp-split-XXXXXX");
     m.fd = mkstemp(m.path);
     CHECK(m.fd >= 0);
@@ -141,7 +163,7 @@ int main(void) {
         n += (uint64_t)wrote;
     }
     const uint64_t offsets[3] = {m.gate_off, m.up_off, m.down_off};
-    const uint32_t types[3] = {16u, 16u, 10u};
+    const uint32_t types[3] = {mx ? 39u : 16u, mx ? 39u : 16u, mx ? 39u : 10u};
     const uint32_t in_dims[3] = {IN_DIM, IN_DIM, MID_DIM};
     const uint64_t want_bytes = N_EXP * (2u * m.gate_expert + m.down_expert) / 2u;
 
@@ -175,10 +197,11 @@ int main(void) {
         ds4_gpu_tensor_free(slab);
     }
 
-    const uint32_t token_counts[] = {2, 3, 5, 6, 8};
+    const uint32_t token_counts[] = {2, 3, 5, 6, 8, 1, 9};
     int fails = 0;
     for (size_t tc = 0; tc < sizeof(token_counts) / sizeof(token_counts[0]); tc++) {
         const uint32_t n = token_counts[tc];
+        if (!mx && (n == 1 || n == 9)) continue;
         const uint64_t slots = (uint64_t)n * TOPK;
         /* Inputs also cover the 9-row call below. */
         const uint32_t n_alloc = 9u;
@@ -210,9 +233,10 @@ int main(void) {
             /* A rebuild starts clean and is complete. */
             CHECK(build_split(&m, r, types, in_dims, offsets) == want_bytes);
             CHECK(run_moe(&m, n, ids, w, x, y_r[r], mid_r[r], MID_DIM / 2));
-            /* Outside the vector path the split has no path: fail, never raw. */
-            CHECK(!run_moe(&m, 1, ids, w, x, NULL, NULL, MID_DIM / 2));
-            CHECK(!run_moe(&m, 9, ids, w, x, NULL, NULL, MID_DIM / 2));
+            if (!mx) {
+                CHECK(!run_moe(&m, 1, ids, w, x, NULL, NULL, MID_DIM / 2));
+                CHECK(!run_moe(&m, 9, ids, w, x, NULL, NULL, MID_DIM / 2));
+            }
             /* Leader-local drafting suspends sharding: raw experts, reference result. */
             ds4_gpu_tp_suspend_expert_sharding(1);
             CHECK(run_moe(&m, n, ids, w, x, y_raw, mid_raw, MID_DIM));

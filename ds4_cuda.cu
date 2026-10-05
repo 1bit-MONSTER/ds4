@@ -479,6 +479,8 @@ enum cuda_derived_kind {
      * down K blocks, for the lockstep TP drafter. */
     CUDA_DERIVED_DSPARK_TP_ROWS = 10,
     CUDA_DERIVED_DSPARK_TP_KHALF = 11,
+    /* F16 weight rows interleaved by K/32 lane chunk for one-row pairs. */
+    CUDA_DERIVED_F16_PAIR_CHUNKS = 12,
 };
 
 struct cuda_derived_range {
@@ -4706,6 +4708,143 @@ extern "C" int ds4_gpu_set_model_fd(int fd) {
     return 1;
 }
 
+/* One-row F16 pairs on Spark (the DeepSeek V4 compressor projections).
+ * matmul_f16_pair_ordered_chunks_kernel gives lane l the K/32 consecutive
+ * terms starting at l*K/32, so neighboring lanes read addresses K/16 bytes
+ * apart.  The chunked copy of a weight stores, in every row, lane l's terms
+ * t..t+7 at 16-byte slot (t/8)*32 + l, so one warp-wide load covers 512
+ * contiguous bytes.  Each lane still accumulates its own terms in order with
+ * the same FMAs, and the 32 lane sums are added in lane order: the outputs
+ * are bit-identical to the ordered kernel.  Used for the measured shapes,
+ * K = 4096 and at most 16384 rows, with a 16-byte aligned activation row. */
+__global__ static void f16_pair_chunks_pack_kernel(__half *dst, const __half *src,
+                                                   uint32_t in_dim, uint32_t out_dim) {
+    const uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (uint64_t)in_dim * out_dim) return;
+    const uint64_t row = i / in_dim;
+    const uint32_t col = (uint32_t)(i % in_dim), chunk = in_dim / 32u;
+    const uint32_t lane = col / chunk, t = col % chunk;
+    dst[row * in_dim + ((t / 8u) * 32u + lane) * 8u + t % 8u] = src[i];
+}
+
+__global__ static void matmul_f16_pair_chunks_kernel(
+        float *out0, float *out1, const uint4 *w0, const uint4 *w1,
+        const float *x, uint32_t in_dim, uint32_t out_dim) {
+    const uint32_t lane = threadIdx.x & 31u, warp = threadIdx.x / 32u;
+    const uint32_t row = blockIdx.x * 4u + warp, chunk = in_dim / 32u;
+    __shared__ float p0[4][32], p1[4][32];
+    float v0 = 0.0f, v1 = 0.0f;
+    if (row < out_dim) {
+        for (uint32_t t = 0; t < chunk; t += 8u) {
+            const uint64_t off = (uint64_t)row * (in_dim / 8u) + (t / 8u) * 32u + lane;
+            const uint4 aw = w0[off], bw = w1[off];
+            const float4 x0 = ((const float4 *)x)[(lane * chunk + t) / 4u];
+            const float4 x1 = ((const float4 *)x)[(lane * chunk + t) / 4u + 1u];
+            const float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            const __half *ah = (const __half *)&aw, *bh = (const __half *)&bw;
+#pragma unroll
+            for (uint32_t j = 0; j < 8u; j++) {
+                v0 += __half2float(ah[j]) * xs[j];
+                v1 += __half2float(bh[j]) * xs[j];
+            }
+        }
+    }
+    p0[warp][lane] = v0;
+    p1[warp][lane] = v1;
+    __syncthreads();
+    if (lane == 0 && row < out_dim) {
+        v0 = 0.0f;
+        v1 = 0.0f;
+        for (uint32_t i = 0; i < 32u; i++) {
+            v0 += p0[warp][i];
+            v1 += p1[warp][i];
+        }
+        out0[row] = v0;
+        out1[row] = v1;
+    }
+}
+
+/* Chunked copies of the compressor kv/gate weights (attention and indexer),
+ * read through the loader's direct-I/O staging rather than the mapping. The
+ * raw weights stay resident for batched and reference paths.  Tensors with
+ * these names but another type or shape (K != 4096 or more than 16384 rows)
+ * keep only their raw weights.  Any failure drops every copy built here.
+ * Returns the bytes allocated. */
+static uint64_t cuda_build_f16_pair_chunks(const void *model_map, uint64_t model_size,
+                                           const ds4_repack_file &mapped,
+                                           const std::vector<ds4_repack_tensor> &records) {
+    if (!ds4_gpu_device_is_spark() || g_ssd_streaming_mode || g_n_gpus > 1) return 0;
+    std::vector<const ds4_repack_tensor *> chosen;
+    uint64_t max_bytes = 0;
+    for (const ds4_repack_tensor &t : records) {
+        unsigned layer;
+        char name[64];
+        if (t.type != 1u || t.ndim != 2u || t.dims[0] != 4096u ||
+            t.dims[1] == 0u || t.dims[1] > 16384u ||
+            t.bytes != t.dims[0] * t.dims[1] * sizeof(__half) ||
+            t.off > model_size || t.bytes > model_size - t.off ||
+            sscanf(t.name.c_str(), "blk.%u.%63s", &layer, name) != 2 ||
+            (strcmp(name, "attn_compressor_kv.weight") != 0 &&
+             strcmp(name, "attn_compressor_gate.weight") != 0 &&
+             strcmp(name, "indexer_compressor_kv.weight") != 0 &&
+             strcmp(name, "indexer_compressor_gate.weight") != 0)) {
+            continue;
+        }
+        chosen.push_back(&t);
+        if (t.bytes > max_bytes) max_bytes = t.bytes;
+    }
+    if (chosen.empty()) return 0;
+
+    const double t0 = cuda_wall_sec();
+    const uint64_t align = mapped.direct_align > 1 ? mapped.direct_align : 4096u;
+    const uint64_t stage_bytes = max_bytes + 2u * align;
+    void *stage = NULL;
+    __half *raw = NULL;
+    if (cudaMallocHost(&stage, (size_t)stage_bytes) != cudaSuccess ||
+        cudaMalloc((void **)&raw, (size_t)max_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (stage) (void)cudaFreeHost(stage);
+        return 0;
+    }
+    const size_t first_new = g_derived_ranges.size();
+    uint64_t built = 0;
+    bool ok = true;
+    for (const ds4_repack_tensor *t : chosen) {
+        const char *payload = NULL;
+        __half *packed = NULL;
+        const uint64_t n = t->bytes / sizeof(__half);
+        ok = ds4_repack_read_stage(mapped, stage, stage_bytes, t->off, t->bytes, &payload) &&
+             cudaMemcpy(raw, payload, (size_t)t->bytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMalloc((void **)&packed, (size_t)t->bytes) == cudaSuccess;
+        if (ok) {
+            f16_pair_chunks_pack_kernel<<<(unsigned)((n + 255u) / 256u), 256>>>(
+                    packed, raw, (uint32_t)t->dims[0], (uint32_t)t->dims[1]);
+            ok = cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+        }
+        if (!ok) {
+            (void)cudaGetLastError();
+            if (packed) (void)cudaFree(packed);
+            break;
+        }
+        g_derived_ranges.push_back({model_map, t->off, t->bytes, CUDA_DERIVED_F16_PAIR_CHUNKS,
+                                    t->dims[0], t->dims[1], 1u, t->bytes, (char *)packed});
+        built += t->bytes;
+    }
+    (void)cudaFree(raw);
+    (void)cudaFreeHost(stage);
+    if (!ok) {
+        for (size_t i = first_new; i < g_derived_ranges.size(); i++) {
+            (void)cudaFree(g_derived_ranges[i].device_ptr);
+        }
+        g_derived_ranges.resize(first_new);
+        fprintf(stderr, "ds4: F16 pair chunk build failed; using raw weights\n");
+        return 0;
+    }
+    fprintf(stderr, "ds4: built %zu F16 pair chunk copies (%.2f GiB) in %.1fs\n",
+            chosen.size(), (double)built / 1073741824.0, cuda_wall_sec() - t0);
+    return built;
+}
+
 static int cuda_build_derived_artifacts(
         const void *model_map,
         uint64_t model_size, uint64_t file_size,
@@ -4735,8 +4874,18 @@ static int cuda_build_derived_artifacts(
     std::vector<ds4_repack_tensor> records;
     const bool catalog_ok =
         ds4_repack_collect_catalog("ds4", mapped, nullptr, &records);
+    if (catalog_ok) {
+        /* Replicated in network TP: every rank runs the whole pair. */
+        g_derived_artifact_bytes += cuda_build_f16_pair_chunks(model_map, model_size, mapped, records);
+    }
     ds4_repack_unmap_file(mapped);
     if (!catalog_ok) return 0;
+
+    /* MXFP4 checkpoints have never built aligned repacks (their tensors were
+     * outside the catalog); keep that. */
+    for (const ds4_repack_tensor &t : records) {
+        if (t.type == 39u) return (int)g_derived_ranges.size();
+    }
 
     if (world == 2u) {
         /* Repack only the owned half. Dense projections have different slice
@@ -4744,12 +4893,16 @@ static int cuda_build_derived_artifacts(
         std::vector<ds4_repack_tensor> owned;
         for (ds4_repack_tensor t : records) {
             if (!ds4_repack_iq2_candidate(t) && !ds4_repack_q2k_candidate(t)) continue;
-            if (t.dims[2] % world || t.bytes % world || t.elements % world) return 0;
+            if (t.dims[2] % world || t.bytes % world || t.elements % world) {
+                return (int)g_derived_ranges.size();
+            }
             t.dims[2] /= world;
             t.bytes /= world;
             t.elements /= world;
             t.off += rank * t.bytes;
-            if (t.off > model_size || t.bytes > model_size - t.off) return 0;
+            if (t.off > model_size || t.bytes > model_size - t.off) {
+                return (int)g_derived_ranges.size();
+            }
             owned.push_back(t);
         }
         records.swap(owned);
@@ -4758,7 +4911,7 @@ static int cuda_build_derived_artifacts(
     const bool build_moe =
         cuda_aligned_iq2_enabled() && cuda_aligned_q2k_enabled();
     const bool build_q8 = world == 1u && cuda_aligned_q8_enabled();
-    if (!build_moe && !build_q8) return 0;
+    if (!build_moe && !build_q8) return (int)g_derived_ranges.size();
 
     ds4_repack_build_args args;
     args.log_prefix = "ds4";
@@ -4790,7 +4943,7 @@ static int cuda_build_derived_artifacts(
             if (artifact.dev) (void)cudaFree(artifact.dev);
         }
         fprintf(stderr, "ds4: aligned artifact build failed; using raw weights\n");
-        return 0;
+        return (int)g_derived_ranges.size();
     }
 
     for (const ds4_repack_artifact &artifact : artifacts) {
@@ -4828,7 +4981,7 @@ static int cuda_build_derived_artifacts(
 
     g_derived_replace_map = model_map;
     g_derived_replaces_complete = replaces_complete;
-    g_derived_artifact_bytes = built_bytes;
+    g_derived_artifact_bytes += built_bytes;
     g_derived_artifact_build_secs = cuda_wall_sec() - t0;
     if (!g_aligned_q81_scratch) {
         const size_t scratch_bytes = 96u * 1024u * 1024u;
@@ -4847,8 +5000,8 @@ static int cuda_build_derived_artifacts(
     }
     fprintf(stderr,
             "ds4: built %llu aligned CUDA artifacts (%.2f GiB) in %.1fs%s\n",
-            (unsigned long long)g_derived_ranges.size(),
-            (double)g_derived_artifact_bytes / 1073741824.0,
+            (unsigned long long)artifacts.size(),
+            (double)built_bytes / 1073741824.0,
             g_derived_artifact_build_secs,
             replaces_complete ? "; expert raw residency replaced" : "");
     return (int)g_derived_ranges.size();
@@ -10299,6 +10452,7 @@ __device__ __forceinline__ void attention_compact_topk_stable(
     }
 }
 
+template<bool CACHE_QUERY = false>
 __global__ static void attention_indexed_mixed_kernel(
         float *heads,
         const float *sinks,
@@ -10316,7 +10470,8 @@ __global__ static void attention_indexed_mixed_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim_arg) {
+    const uint32_t head_dim = CACHE_QUERY ? 512u : head_dim_arg;
     uint32_t t = blockIdx.x;
     uint32_t h = blockIdx.y;
     if (t >= n_tokens || h >= n_head) return;
@@ -10338,7 +10493,8 @@ __global__ static void attention_indexed_mixed_kernel(
     __shared__ uint32_t raw_first_idx;
     __shared__ uint32_t comp_count;
     __shared__ uint32_t comp_warp_offsets[8];
-    float scale = rsqrtf((float)head_dim);
+    /* Keep the runtime rsqrt rounding even in the fixed-width specialization. */
+    float scale = rsqrtf((float)head_dim_arg);
     if (threadIdx.x == 0) {
         raw_count = 0;
         raw_first_idx = 0;
@@ -10379,6 +10535,11 @@ __global__ static void attention_indexed_mixed_kernel(
     } else {
         uint32_t qlane = threadIdx.x & 7u;
         uint32_t qgroup = threadIdx.x >> 3u;
+        float query[CACHE_QUERY ? 64 : 1];
+        if (CACHE_QUERY) {
+#pragma unroll
+            for (uint32_t d = 0; d < 64; d++) query[d] = qh[qlane + d * 8u];
+        }
         for (uint32_t row0 = 0; row0 < n_score; row0 += 32u) {
             uint32_t row = row0 + qgroup;
             if (row < n_score) {
@@ -10386,7 +10547,16 @@ __global__ static void attention_indexed_mixed_kernel(
                     ? raw_kv + (uint64_t)raw_rows[row] * head_dim
                     : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
                 float dot = 0.0f;
-                for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                if (CACHE_QUERY) {
+                    /* A fixed trip count keeps the query in registers and
+                     * overlaps key loads without changing the FMA order. */
+#pragma unroll
+                    for (uint32_t d = 0; d < 64; d++) {
+                        dot += query[d] * kvrow[qlane + d * 8u];
+                    }
+                } else {
+                    for (uint32_t d = qlane; d < head_dim; d += 8u) dot += qh[d] * kvrow[d];
+                }
                 const uint32_t mask = 0xffu << (threadIdx.x & 24u);
                 for (uint32_t off = 4u; off > 0u; off >>= 1u) {
                     dot += __shfl_down_sync(mask, dot, off, 8);
@@ -10448,6 +10618,239 @@ __global__ static void attention_indexed_mixed_kernel(
             oh[d] = acc / denom;
         }
     }
+}
+
+/* One-row indexed attention on Spark in three passes, bit-identical to
+ * attention_indexed_mixed_kernel<true>: that kernel keeps one block per head,
+ * so its per-row dots and per-output value chains are latency-bound.
+ *   1. scores, blocks of 32 rows x 4 heads: the same row plan (raw window
+ *      rows, then attention_compact_topk_stable) and the same per-row dot
+ *      (8 lanes, d = lane + 8k in order, shuffles 4/2/1, times the runtime
+ *      rsqrtf(head_dim)); one load of each row value feeds the 4 heads;
+ *   2. stats, one block of 256 per head: the same max (sink first), the same
+ *      expf and strided per-thread sums, the same halving trees, sink last;
+ *   3. values, blocks of 8 heads x 16 dimensions: every output keeps the
+ *      chain acc += kv * p over raw rows then compacted rows, then
+ *      acc / denom.
+ * All three run on the decode stream from one scratch buffer. */
+#define INDEXED_ONE_MAX_SCORE 768u          /* 256 raw rows + 512 top-k rows */
+#define INDEXED_ONE_SROWS 32u               /* score rows per block: one per 8-lane group */
+#define INDEXED_ONE_SHEADS 4u               /* score heads per block */
+#define INDEXED_ONE_VHEADS 8u
+#define INDEXED_ONE_VDIMS 16u
+#define INDEXED_ONE_CHUNK 128u
+#define INDEXED_ONE_MAX_HEADS 64u
+#define INDEXED_ONE_COMP 0x80000000u        /* row list: compressed row flag */
+
+/* Scratch: scores[n_head][768] (exp weights after pass 2), denom[n_head],
+ * rows[768], and the number of visible scores. */
+static uint64_t attention_indexed_one_scratch_bytes(uint32_t n_head) {
+    return (uint64_t)n_head * INDEXED_ONE_MAX_SCORE * 4u +
+           (uint64_t)n_head * 4u + INDEXED_ONE_MAX_SCORE * 4u + sizeof(uint32_t);
+}
+
+/* grid (768 / 32, ceil(n_head / 4)), 256 threads.  Each 8-lane group owns
+ * one row for the block's 4 heads: one load of each row value feeds four
+ * independent per-head chains, each in the scalar order. */
+__global__ static void attention_indexed_one_scores_kernel(
+        float *scores, uint32_t *rows_out, uint32_t *count,
+        const float *q, const float *raw_kv, const float *comp_kv, const int32_t *topk,
+        uint32_t pos0, uint32_t n_raw, uint32_t raw_cap, uint32_t raw_start,
+        uint32_t n_comp, uint32_t top_k, uint32_t window, uint32_t ratio, uint32_t n_head,
+        uint32_t head_dim_arg) {
+    const uint32_t head_dim = 512u;
+    const uint32_t qpos = pos0;
+    const uint32_t first_raw_pos = pos0 + 1u - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[512];
+    __shared__ uint32_t raw_count;
+    __shared__ uint32_t raw_first_idx;
+    __shared__ uint32_t comp_count;
+    __shared__ uint32_t comp_warp_offsets[8];
+    __shared__ __align__(16) float q_s[INDEXED_ONE_SHEADS][512];
+    /* The runtime rsqrt, as in the scalar kernel: a folded constant rounds differently. */
+    const float scale = rsqrtf((float)head_dim_arg);
+    const uint32_t row0 = blockIdx.x * INDEXED_ONE_SROWS, h0 = blockIdx.y * INDEXED_ONE_SHEADS;
+    const uint32_t nheads = n_head - h0 < INDEXED_ONE_SHEADS ? n_head - h0 : INDEXED_ONE_SHEADS;
+    for (uint32_t i = threadIdx.x; i < INDEXED_ONE_SHEADS * (head_dim / 4u); i += blockDim.x) {
+        const uint32_t hh = i / (head_dim / 4u), v = i % (head_dim / 4u);
+        *(float4 *)&q_s[hh][4u * v] = hh < nheads
+            ? ((const float4 *)(q + (uint64_t)(h0 + hh) * head_dim))[v] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if (threadIdx.x == 0) {
+        raw_count = 0;
+        raw_first_idx = 0;
+        if (n_raw != 0) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0 && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    for (uint32_t r = threadIdx.x; r < raw_count; r += blockDim.x) {
+        raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+    }
+    attention_compact_topk_stable(comp_rows, &comp_count, comp_warp_offsets, topk, top_k, visible_comp);
+    const uint32_t n_score = raw_count + comp_count;
+    if (blockIdx.x == 0 && blockIdx.y == 0) {
+        for (uint32_t r = threadIdx.x; r < n_score; r += blockDim.x) {
+            rows_out[r] = r < raw_count ? raw_rows[r] : (comp_rows[r - raw_count] | INDEXED_ONE_COMP);
+        }
+        if (threadIdx.x == 0) *count = n_score;
+    }
+    if (row0 >= n_score) return;
+    if (comp_count == 0) {
+        /* Raw rows only: the scalar kernel dots each row serially. */
+        const uint32_t hh = threadIdx.x / INDEXED_ONE_SROWS, row = row0 + threadIdx.x % INDEXED_ONE_SROWS;
+        if (hh < nheads && row < raw_count) {
+            const float *kvrow = raw_kv + (uint64_t)raw_rows[row] * head_dim;
+            float dot = 0.0f;
+            for (uint32_t d = 0; d < head_dim; d++) dot += q_s[hh][d] * kvrow[d];
+            scores[(uint64_t)(h0 + hh) * INDEXED_ONE_MAX_SCORE + row] = dot * scale;
+        }
+        return;
+    }
+    const uint32_t qlane = threadIdx.x & 7u;
+    const uint32_t row = row0 + (threadIdx.x >> 3u);
+    if (row < n_score) {
+        const float *kvrow = row < raw_count
+            ? raw_kv + (uint64_t)raw_rows[row] * head_dim
+            : comp_kv + (uint64_t)comp_rows[row - raw_count] * head_dim;
+        float dot[INDEXED_ONE_SHEADS] = {};
+#pragma unroll
+        for (uint32_t d = 0; d < 64; d++) {
+            const float kv = kvrow[qlane + d * 8u];
+#pragma unroll
+            for (uint32_t hh = 0; hh < INDEXED_ONE_SHEADS; hh++) dot[hh] += q_s[hh][qlane + d * 8u] * kv;
+        }
+        const uint32_t mask = 0xffu << (threadIdx.x & 24u);
+#pragma unroll
+        for (uint32_t hh = 0; hh < INDEXED_ONE_SHEADS; hh++) {
+            for (uint32_t off = 4u; off > 0u; off >>= 1u) {
+                dot[hh] += __shfl_down_sync(mask, dot[hh], off, 8);
+            }
+        }
+        if (qlane == 0) {
+            for (uint32_t hh = 0; hh < nheads; hh++) {
+                scores[(uint64_t)(h0 + hh) * INDEXED_ONE_MAX_SCORE + row] = dot[hh] * scale;
+            }
+        }
+    }
+}
+
+/* One block of 256 threads per head, as in the scalar kernel. */
+__global__ static void attention_indexed_one_stats_kernel(float *scores, float *denoms, const uint32_t *count,
+                                          const float *sinks) {
+    const uint32_t h = blockIdx.x;
+    const uint32_t n_score = *count;
+    float *s = scores + (uint64_t)h * INDEXED_ONE_MAX_SCORE;
+    __shared__ float partial[256];
+    __shared__ float max_s;
+    float local_max = sinks[h];
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        local_max = fmaxf(local_max, s[i]);
+    }
+    partial[threadIdx.x] = local_max;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] = fmaxf(partial[threadIdx.x], partial[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) max_s = partial[0];
+    __syncthreads();
+    float den_local = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) {
+        s[i] = expf(s[i] - max_s);
+        den_local += s[i];
+    }
+    partial[threadIdx.x] = den_local;
+    __syncthreads();
+    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) denoms[h] = partial[0] + expf(sinks[h] - max_s);
+}
+
+/* grid (512 / 16, ceil(n_head / 8)), 128 threads: thread (g, c) keeps the
+ * scalar chain for output (8 * blockIdx.y + g, 16 * blockIdx.x + c). */
+__global__ static void attention_indexed_one_values_kernel(float *heads, const float *scores, const float *denoms,
+                                           const uint32_t *rows, const uint32_t *count,
+                                           const float *raw_kv, const float *comp_kv, uint32_t n_head) {
+    const uint32_t head_dim = 512u;
+    const uint32_t c = threadIdx.x % INDEXED_ONE_VDIMS, g = threadIdx.x / INDEXED_ONE_VDIMS;
+    const uint32_t h = blockIdx.y * INDEXED_ONE_VHEADS + g, d = blockIdx.x * INDEXED_ONE_VDIMS + c;
+    const uint32_t n_score = *count;
+    __shared__ uint32_t rows_s[INDEXED_ONE_MAX_SCORE];
+    __shared__ __align__(16) float kv_s[INDEXED_ONE_CHUNK][INDEXED_ONE_VDIMS];
+    __shared__ float p_s[INDEXED_ONE_VHEADS][INDEXED_ONE_CHUNK + 1u];
+    for (uint32_t i = threadIdx.x; i < n_score; i += blockDim.x) rows_s[i] = rows[i];
+    __syncthreads();
+    float acc = 0.0f;
+    for (uint32_t base = 0; base < n_score; base += INDEXED_ONE_CHUNK) {
+        const uint32_t nr = n_score - base < INDEXED_ONE_CHUNK ? n_score - base : INDEXED_ONE_CHUNK;
+        for (uint32_t i = threadIdx.x; i < nr * (INDEXED_ONE_VDIMS / 4u); i += blockDim.x) {
+            const uint32_t r = i / (INDEXED_ONE_VDIMS / 4u), v = i % (INDEXED_ONE_VDIMS / 4u), row = rows_s[base + r];
+            const float *kv = (row & INDEXED_ONE_COMP) ? comp_kv + (uint64_t)(row & ~INDEXED_ONE_COMP) * head_dim
+                                                 : raw_kv + (uint64_t)row * head_dim;
+            *(float4 *)&kv_s[r][4u * v] = ((const float4 *)(kv + blockIdx.x * INDEXED_ONE_VDIMS))[v];
+        }
+        for (uint32_t i = threadIdx.x; i < INDEXED_ONE_VHEADS * nr; i += blockDim.x) {
+            const uint32_t gg = i / nr, r = i % nr, hh = blockIdx.y * INDEXED_ONE_VHEADS + gg;
+            if (hh < n_head) p_s[gg][r] = scores[(uint64_t)hh * INDEXED_ONE_MAX_SCORE + base + r];
+        }
+        __syncthreads();
+        if (h < n_head) {
+#pragma unroll 8
+            for (uint32_t r = 0; r < nr; r++) acc += kv_s[r][c] * p_s[g][r];
+        }
+        __syncthreads();
+    }
+    if (h < n_head) heads[(uint64_t)h * head_dim + d] = acc / denoms[h];
+}
+
+/* 0: shape outside this path; 1: launched; -1: launch error (reported). */
+static int attention_indexed_one_launch(float *heads, const float *sinks, const float *q, const float *raw_kv,
+                                        const float *comp_kv, const int32_t *topk, uint32_t pos0, uint32_t n_raw,
+                                        uint32_t raw_cap, uint32_t raw_start, uint32_t n_comp, uint32_t top_k,
+                                        uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim,
+                                        void *scratch, cudaStream_t stream) {
+    if (head_dim != 512u || top_k == 0u || top_k > 512u || n_head == 0u || n_head > INDEXED_ONE_MAX_HEADS ||
+        n_raw == 0u || raw_cap < n_raw || raw_start >= raw_cap || raw_cap >= INDEXED_ONE_COMP ||
+        n_comp >= INDEXED_ONE_COMP || !scratch) return 0;
+    float *scores = (float *)scratch;
+    float *denoms = scores + (uint64_t)n_head * INDEXED_ONE_MAX_SCORE;
+    uint32_t *rows = (uint32_t *)(denoms + n_head);
+    uint32_t *count = rows + INDEXED_ONE_MAX_SCORE;
+    attention_indexed_one_scores_kernel<<<dim3(INDEXED_ONE_MAX_SCORE / INDEXED_ONE_SROWS,
+                                               (n_head + INDEXED_ONE_SHEADS - 1u) / INDEXED_ONE_SHEADS),
+                                          256, 0, stream>>>(
+        scores, rows, count, q, raw_kv, comp_kv, topk, pos0, n_raw, raw_cap, raw_start,
+        n_comp, top_k, window, ratio, n_head, head_dim);
+    if (!cuda_ok(cudaGetLastError(), "attention indexed one-row scores launch")) return -1;
+    attention_indexed_one_stats_kernel<<<n_head, 256, 0, stream>>>(scores, denoms, count, sinks);
+    if (!cuda_ok(cudaGetLastError(), "attention indexed one-row stats launch")) return -1;
+    attention_indexed_one_values_kernel<<<dim3(head_dim / INDEXED_ONE_VDIMS,
+                                               (n_head + INDEXED_ONE_VHEADS - 1u) / INDEXED_ONE_VHEADS),
+                                          INDEXED_ONE_VHEADS * INDEXED_ONE_VDIMS, 0, stream>>>(
+        heads, scores, denoms, rows, count, raw_kv, comp_kv, n_head);
+    return cuda_ok(cudaGetLastError(), "attention indexed one-row launch") ? 1 : -1;
 }
 
 __global__ static void attention_indexed_mixed_decode_rows_kernel(
@@ -10796,7 +11199,9 @@ __global__ static void attention_indexed_mixed_heads8_rb4_kernel(
     }
 }
 
-template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP>
+/* Split chunks retain unnormalized softmax sums; the existing decode combiner
+ * merges them and adds the sink once. Only the FP32 reduction order changes. */
+template <uint32_t ROWS_PER_STAGE, uint32_t HEADS_PER_GROUP, bool SPLITKV = false>
 __global__ static void __launch_bounds__(512, 2)
 attention_indexed_mixed_heads8_online_kernel(
         float *heads,
@@ -10815,7 +11220,9 @@ attention_indexed_mixed_heads8_online_kernel(
         uint32_t window,
         uint32_t ratio,
         uint32_t n_head,
-        uint32_t head_dim) {
+        uint32_t head_dim,
+        float *partials,
+        uint32_t split) {
     uint32_t t = blockIdx.x;
     uint32_t head_group = blockIdx.y;
     if (t >= n_tokens || head_dim != 512u) return;
@@ -10883,8 +11290,14 @@ attention_indexed_mixed_heads8_online_kernel(
     float4 o0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
     float4 o1 = o0, o2 = o0, o3 = o0;
 
-    for (uint32_t row0 = 0; row0 < n_score; row0 += ROWS_PER_STAGE) {
-        const uint32_t nr = n_score - row0 < ROWS_PER_STAGE ? n_score - row0 : ROWS_PER_STAGE;
+    uint32_t row_begin = 0u, row_end = n_score;
+    if (SPLITKV) {
+        const uint32_t chunk = (n_score + split - 1u) / split;
+        row_begin = blockIdx.z * chunk < n_score ? blockIdx.z * chunk : n_score;
+        row_end = n_score - row_begin < chunk ? n_score : row_begin + chunk;
+    }
+    for (uint32_t row0 = row_begin; row0 < row_end; row0 += ROWS_PER_STAGE) {
+        const uint32_t nr = row_end - row0 < ROWS_PER_STAGE ? row_end - row0 : ROWS_PER_STAGE;
         for (uint32_t off = threadIdx.x; off < nr * 128u; off += blockDim.x) {
             const uint32_t rr = off >> 7u;
             const uint32_t c4 = off & 127u;
@@ -10941,6 +11354,30 @@ attention_indexed_mixed_heads8_online_kernel(
             }
         }
         __syncthreads();
+    }
+
+    if (SPLITKV) {
+        if (valid_head) {
+            float *pout = partials +
+                (((uint64_t)t * n_head + head) * split + blockIdx.z) * ((uint64_t)head_dim + 2u);
+            if (lane == 0u) {
+                pout[0] = max_s;
+                pout[1] = sum_s;
+            }
+            /* Masked chunks retain (-INF, 0, 0), skipped by the combiner.
+             * The accumulator is only 8-byte aligned, so use scalar stores. */
+            float *acc = pout + 2u;
+            const float4 parts[4] = {o0, o1, o2, o3};
+#pragma unroll
+            for (uint32_t k = 0; k < 4u; k++) {
+                const uint32_t e = (lane + 32u * k) * 4u;
+                acc[e + 0u] = parts[k].x;
+                acc[e + 1u] = parts[k].y;
+                acc[e + 2u] = parts[k].z;
+                acc[e + 3u] = parts[k].w;
+            }
+        }
+        return;
     }
 
     if (valid_head) {
@@ -13923,6 +14360,76 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
+/* Convert once instead of in each key tile; unused token rows are zero. */
+__global__ static void indexer_q_f16_rows16_kernel(
+        __half *q16, const float *q, uint32_t n_tokens) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 64u * 16u * 128u) return;
+    const uint32_t d = i & 127u, r = (i >> 7u) & 15u, h = i >> 11u;
+    q16[i] = __float2half(r < n_tokens ? q[((uint64_t)r * 64u + h) * 128u + d] : 0.0f);
+}
+
+/* Same half rounding, MMA order and head reduction as wmma128. One warp
+ * owns 16 keys, retaining their fragments across all 64 query heads. */
+__global__ static void __launch_bounds__(32)
+indexer_scores_rows16_kernel(
+        float *scores, const __half *q16, const float *weights,
+        const float *index_comp, uint32_t n_comp, uint32_t n_tokens,
+        uint32_t pos0, uint32_t ratio, float scale, int causal) {
+#if __CUDA_ARCH__ >= 800
+    namespace wmma = nvcuda::wmma;
+    const uint32_t lane = threadIdx.x;
+    const uint32_t tile_c = blockIdx.x * 16u;
+    if (tile_c >= n_comp) return;
+    if (causal && tile_c >= min((pos0 + n_tokens) / ratio, n_comp)) {
+        for (uint32_t i = lane; i < 16u * 16u; i += 32u) {
+            const uint32_t r = i >> 4u, comp = tile_c + (i & 15u);
+            if (r < n_tokens && comp < n_comp)
+                scores[(uint64_t)r * n_comp + comp] = -INFINITY;
+        }
+        return;
+    }
+    __shared__ __half bw[16 * 136];
+    for (uint32_t i = lane; i < 16u * 128u; i += 32u) {
+        const uint32_t c = i >> 7u, d = i & 127u, comp = tile_c + c;
+        bw[c * 136u + d] = __float2half(comp < n_comp
+            ? index_comp[(uint64_t)comp * 128u + d] : 0.0f);
+    }
+    __syncwarp();
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[8];
+#pragma unroll
+    for (uint32_t k = 0; k < 8u; k++) wmma::load_matrix_sync(b[k], bw + k * 16u, 136);
+    const uint32_t quad = lane >> 2u, tcol = (lane & 3u) * 2u;
+    float acc[8] = {};
+#pragma unroll 2
+    for (uint32_t h = 0; h < 64u; h++) {
+        const __half *qa = q16 + (uint64_t)h * 16u * 128u;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[8];
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) wmma::load_matrix_sync(a[k], qa + k * 16u, 128);
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+        wmma::fill_fragment(c, 0.0f);
+#pragma unroll
+        for (uint32_t k = 0; k < 8u; k++) wmma::mma_sync(c, a[k], b[k], c);
+        const float w_lo = quad < n_tokens ? weights[(uint64_t)quad * 64u + h] : 0.0f;
+        const float w_hi = quad + 8u < n_tokens ? weights[(uint64_t)(quad + 8u) * 64u + h] : 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[i] += fmaxf(c.x[i], 0.0f) * ((i & 2) ? w_hi : w_lo);
+    }
+    /* SM80+ WMMA accumulator layout, also used by wmma128 above. */
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const uint32_t row = quad + ((i & 2) ? 8u : 0u);
+        const uint32_t comp = tile_c + tcol + (i & 1) + ((i & 4) ? 8u : 0u);
+        if (row < n_tokens && comp < n_comp) {
+            float out = acc[i] * scale;
+            if (causal && comp >= (pos0 + row + 1u) / ratio) out = -INFINITY;
+            scores[(uint64_t)row * n_comp + comp] = out;
+        }
+    }
+#endif
+}
+
 #ifdef DS4_CUDA_HAVE_MXF4
 #define DS4_MXF4_INDEXER_HEADS 64u
 #define DS4_MXF4_INDEXER_DIM 128u
@@ -14630,14 +15137,19 @@ __device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) 
     return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
 }
 
-__global__ static void indexer_topk_8192_cub_kernel(
+/* Short rows need only 11 or 12 index bits. Keep the full score and exact
+ * index tie-break while sorting fewer radix digits. IDX_BITS=0 preserves
+ * the full 64-bit key used for wider rows. */
+template <uint32_t BLOCK_THREADS, uint32_t ITEMS_PER_THREAD, uint32_t IDX_BITS>
+__global__ static void indexer_topk_cub_kernel(
         uint32_t *selected,
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
         uint32_t top_k) {
-    constexpr uint32_t BLOCK_THREADS = 512u;
-    constexpr uint32_t ITEMS_PER_THREAD = 16u;
+    static_assert(IDX_BITS == 0u ||
+                  (1u << IDX_BITS) == BLOCK_THREADS * ITEMS_PER_THREAD,
+                  "index bits must cover the sort block");
     using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
     extern __shared__ __align__(16) unsigned char sort_smem[];
     typename BlockSort::TempStorage &sort_storage =
@@ -14648,26 +15160,46 @@ __global__ static void indexer_topk_8192_cub_kernel(
     if (t >= n_tokens || tid >= BLOCK_THREADS) return;
 
     const float *row = scores + (uint64_t)t * n_comp;
+    constexpr uint32_t idx_mask = IDX_BITS ? (1u << IDX_BITS) - 1u : 0u;
     uint64_t keys[ITEMS_PER_THREAD];
 #pragma unroll
     for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
         const uint32_t i = tid * ITEMS_PER_THREAD + item;
-        if (i < n_comp) {
+        if (IDX_BITS) {
+            /* Padding has a larger index than any valid -INF entry. */
+            const float v = i < n_comp ? row[i] : -INFINITY;
+            keys[item] = ((uint64_t)topk_float_ordered_key(v) << IDX_BITS) |
+                         (uint64_t)(idx_mask - i);
+        } else if (i < n_comp) {
             keys[item] = topk_pack_key(row[i], i);
         } else {
             keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
         }
     }
 
-    BlockSort(sort_storage).SortDescending(keys);
+    if (IDX_BITS) BlockSort(sort_storage).SortDescending(keys, 0, 32 + (int)IDX_BITS);
+    else BlockSort(sort_storage).SortDescending(keys);
 
 #pragma unroll
     for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
         const uint32_t i = tid * ITEMS_PER_THREAD + item;
         if (i < top_k) {
-            selected[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
+            selected[(uint64_t)t * top_k + i] = IDX_BITS
+                ? idx_mask - (uint32_t)(keys[item] & idx_mask)
+                : 0xffffffffu - (uint32_t)keys[item];
         }
     }
+}
+
+template <uint32_t ITEMS, uint32_t BITS>
+static int indexer_topk_compact_cub(uint32_t *selected, const float *scores,
+                                  uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    using Sort = cub::BlockRadixSort<uint64_t, 512, ITEMS>;
+    constexpr size_t smem = sizeof(typename Sort::TempStorage);
+    static_assert(smem <= 48u * 1024u, "compact top-k must fit without shared-memory opt-in");
+    indexer_topk_cub_kernel<512u, ITEMS, BITS><<<n_tokens, 512, smem, cuda_decode_stream()>>>(
+        selected, scores, n_comp, n_tokens, top_k);
+    return cuda_ok(cudaGetLastError(), "indexer compact topk launch");
 }
 
 __global__ static void indexer_topk_1024_kernel(
@@ -15082,8 +15614,12 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         }
         __syncthreads();
 
-        if (s_cnt > STREAM_CAP - tile) {
-            const uint32_t cnt = s_cnt;
+        /* Snapshot before a fast warp starts adding the next tile's keys:
+         * every thread must take the same branch around the sort barriers. */
+        const uint32_t seen = s_cnt;
+        __syncthreads();
+        if (seen > STREAM_CAP - tile) {
+            const uint32_t cnt = seen;
             uint64_t keys[STREAM_ITEMS];
 #pragma unroll
             for (uint32_t k = 0; k < STREAM_ITEMS; k++) {
@@ -15259,6 +15795,23 @@ static int indexer_scores_launch(
     if (!g_quality_mode && head_dim == 128u && n_head == 64u &&
         getenv("DS4_CUDA_NO_INDEXER_WMMA") == NULL) {
         if (getenv("DS4_CUDA_NO_INDEXER_WMMA128") == NULL) {
+            /* Short verifier batches underfill the 128-key grid. At longer
+             * contexts that grid wins again by reusing queries across keys. */
+            if (n_tokens >= 2u && n_tokens <= 16u && n_comp <= 4096u &&
+                ds4_gpu_device_is_spark() && !g_dsv41_shared.active) {
+                __half *q16 = (__half *)cuda_tmp_alloc_on(ds4_tensor_device_idx(scores),
+                    64u * 16u * 128u * sizeof(__half), "indexer q f16 rows16");
+                if (q16) {
+                    indexer_q_f16_rows16_kernel<<<64u * 16u * 128u / 256u, 256>>>(
+                        q16, (const float *)q->ptr, n_tokens);
+                    if (!cuda_ok(cudaGetLastError(), "indexer q f16 rows16 launch")) return 0;
+                    indexer_scores_rows16_kernel<<<(n_comp + 15u) / 16u, 32>>>(
+                        (float *)scores->ptr, q16, (const float *)weights->ptr,
+                        (const float *)index_comp->ptr, n_comp, n_tokens, pos0, ratio, scale, causal ? 1 : 0);
+                    return cuda_ok(cudaGetLastError(), "indexer scores rows16 launch");
+                }
+                (void)cudaGetLastError(); /* The original scorer needs no scratch. */
+            }
             dim3 grid((n_comp + 127u) / 128u, (n_tokens + 31u) / 32u, 1);
             indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                          (const float *)q->ptr,
@@ -15445,6 +15998,15 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                 n_tokens);
         return cuda_ok(cudaGetLastError(), "indexer top1 launch");
     }
+    if (top_k == 512u && n_comp <= 4096u && ds4_gpu_device_is_spark() &&
+        getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
+        (n_comp > 1024u || getenv("DS4_CUDA_NO_TOPK1024") == NULL)) {
+        return n_comp <= 2048u
+            ? indexer_topk_compact_cub<4u, 11u>((uint32_t *)selected->ptr,
+                (const float *)scores->ptr, n_comp, n_tokens, top_k)
+            : indexer_topk_compact_cub<8u, 12u>((uint32_t *)selected->ptr,
+                (const float *)scores->ptr, n_comp, n_tokens, top_k);
+    }
     if (top_k == 2048u && n_comp <= 4096u &&
         getenv("DS4_CUDA_NO_TOPK2048_WIDE") == NULL) {
         indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>(
@@ -15551,11 +16113,11 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                attr_err = cudaFuncSetAttribute(indexer_topk_cub_kernel<512u, 16u, 0u>,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_cub_kernel<512u, 16u, 0u><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 4096 cub launch");
@@ -15582,11 +16144,11 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                   dev);
             }
             if (attr_err == cudaSuccess && max_optin_smem >= smem) {
-                attr_err = cudaFuncSetAttribute(indexer_topk_8192_cub_kernel,
+                attr_err = cudaFuncSetAttribute(indexer_topk_cub_kernel<512u, 16u, 0u>,
                                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                 smem);
                 if (attr_err == cudaSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
+                    indexer_topk_cub_kernel<512u, 16u, 0u><<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
                                                                                  (const float *)scores->ptr,
                                                                                  n_comp, n_tokens, top_k);
                     return cuda_ok(cudaGetLastError(), "indexer topk 8192 cub launch");
@@ -17308,6 +17870,23 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                                            in_dim, out_dim, x, n_tok) &&
                ds4_gpu_matmul_f16_tensor(out1, model_map, model_size, weight1_offset,
                                            in_dim, out_dim, x, n_tok);
+    }
+    if (in_dim == 4096u && out_dim <= 16384u && ((uintptr_t)x->ptr & 15u) == 0u &&
+        ds4_gpu_device_is_spark()) {
+        /* Same arithmetic as the ordered kernel below on chunked copies. */
+        const char *c0 = cuda_derived_weight_ptr(model_map, weight0_offset, weight_bytes,
+                                                 CUDA_DERIVED_F16_PAIR_CHUNKS, in_dim, out_dim, 1u,
+                                                 weight_bytes);
+        const char *c1 = c0 ? cuda_derived_weight_ptr(model_map, weight1_offset, weight_bytes,
+                                                      CUDA_DERIVED_F16_PAIR_CHUNKS, in_dim, out_dim, 1u,
+                                                      weight_bytes)
+                            : NULL;
+        if (c1) {
+            matmul_f16_pair_chunks_kernel<<<(unsigned)((out_dim + 3u) / 4u), 128, 0, cuda_decode_stream()>>>(
+                    (float *)out0->ptr, (float *)out1->ptr, (const uint4 *)c0, (const uint4 *)c1,
+                    (const float *)x->ptr, (uint32_t)in_dim, (uint32_t)out_dim);
+            return cuda_ok(cudaGetLastError(), "matmul_f16_pair_chunks launch");
+        }
     }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32, 0, cuda_decode_stream()>>>(
         (float *)out0->ptr,
@@ -19160,6 +19739,20 @@ extern "C" int ds4_gpu_attention_decode_mixed_batch_heads_tensor(
                                       n_comp, window, ratio, n_head, head_dim);
 }
 
+/* Small Spark batches otherwise launch too few CTAs, each walking all keys.
+ * Split the keys while bounding the partial buffer and the number of CTAs. */
+static uint32_t indexed_attention_split(uint32_t n_tokens, uint32_t n_head,
+                                       uint32_t head_dim, uint32_t top_k) {
+    if (n_tokens < 2u || n_tokens > 8u || head_dim != 512u || top_k != 512u ||
+        !ds4_gpu_device_is_spark() || g_dsv41_shared.active ||
+        getenv("DS4_CUDA_NO_INDEXED_HEADS8") != NULL ||
+        getenv("DS4_CUDA_INDEXED_TWOPASS") != NULL) return 1u;
+    const uint32_t base = n_tokens * ((n_head + 15u) / 16u);
+    uint32_t split = 1u;
+    while (split < 8u && base * split * 2u <= 128u) split *= 2u;
+    return split;
+}
+
 extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         ds4_gpu_tensor       *heads,
         const void             *model_map,
@@ -19309,18 +19902,43 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             (void)cudaGetLastError();
         }
     }
+    const uint32_t split = indexed_attention_split(n_tokens, n_head, head_dim, top_k);
+    const uint64_t partial_bytes = split > 1u
+        ? (uint64_t)n_tokens * n_head * split * ((uint64_t)head_dim + 2u) * sizeof(float) : 0u;
+    float *partials = NULL;
     if (n_tokens > 1u && top_k == 512u &&
         getenv("DS4_CUDA_NO_INDEXED_TOPK_SORT") == NULL) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier, sort_bytes, "indexed attention topk sort");
+        /* Allocate together: growing shared scratch would invalidate sorted. */
+        const uint64_t partial_off = (sort_bytes + 255u) & ~255ull;
+        int32_t *sorted = (int32_t *)cuda_tmp_alloc_on(logical_tier,
+            partial_bytes ? partial_off + partial_bytes : sort_bytes,
+            "indexed attention topk sort");
         if (!sorted) return 0;
+        if (partial_bytes) partials = (float *)((char *)sorted + partial_off);
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!cuda_ok(cudaGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
+    } else if (partial_bytes) {
+        partials = (float *)cuda_tmp_alloc_on(logical_tier, partial_bytes,
+                                             "indexed attention splitkv partials");
+        if (!partials) return 0;
     }
     if (n_tokens > 1 && head_dim == 512 && top_k <= 512u &&
         getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
         if (getenv("DS4_CUDA_INDEXED_TWOPASS") == NULL) {
+            if (split > 1u) {
+                dim3 grid(n_tokens, (n_head + 15u) / 16u, split);
+                attention_indexed_mixed_heads8_online_kernel<8, 16, true><<<grid, 512>>>(
+                    (float *)heads->ptr, sinks, (const float *)q->ptr,
+                    (const float *)raw_kv->ptr, (const float *)comp_kv->ptr, topk_ptr,
+                    n_tokens, pos0, n_raw, raw_cap, raw_start, n_comp, top_k, window, ratio,
+                    n_head, head_dim, partials, split);
+                if (!cuda_ok(cudaGetLastError(), "attention indexed splitkv launch")) return 0;
+                attention_decode_splitkv_combine_kernel<<<dim3(n_tokens, n_head, 1), 256>>>(
+                    (float *)heads->ptr, sinks, partials, n_tokens, n_head, head_dim, split);
+                return cuda_ok(cudaGetLastError(), "attention indexed splitkv combine launch");
+            }
             dim3 grid(n_tokens, (n_head + 15u) / 16u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 16><<<grid, 512>>>((float *)heads->ptr,
                                                                                sinks,
@@ -19338,7 +19956,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                                window,
                                                                                ratio,
                                                                                n_head,
-                                                                               head_dim);
+                                                                               head_dim,
+                                                                               NULL,
+                                                                               1u);
             return cuda_ok(cudaGetLastError(), "attention indexed online launch");
         }
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -19362,7 +19982,27 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return cuda_ok(cudaGetLastError(), "attention indexed heads8 launch");
     }
     dim3 grid(n_tokens, n_head, 1);
-    attention_indexed_mixed_kernel<<<grid, 256>>>((float *)heads->ptr,
+    if (n_tokens == 1u && head_dim == 512u && ds4_gpu_device_is_spark()) {
+        /* Same arithmetic in three passes; DS4_CUDA_NO_INDEXED_HEADS8 keeps the
+         * per-head kernel here too, and a scratch failure falls back to it. */
+        if (n_head <= INDEXED_ONE_MAX_HEADS && getenv("DS4_CUDA_NO_INDEXED_HEADS8") == NULL) {
+            void *scratch = cuda_tmp_alloc_on(logical_tier, attention_indexed_one_scratch_bytes(n_head),
+                                              "indexed one-row attention");
+            const int rc = attention_indexed_one_launch((float *)heads->ptr, sinks, (const float *)q->ptr,
+                                                        (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
+                                                        topk_ptr, pos0, n_raw, raw_cap, raw_start, n_comp, top_k,
+                                                        window, ratio, n_head, head_dim, scratch,
+                                                        cuda_decode_stream());
+            if (rc != 0) return rc > 0;
+        }
+        attention_indexed_mixed_kernel<true><<<grid, 256, 0, cuda_decode_stream()>>>(
+            (float *)heads->ptr, sinks, (const float *)q->ptr,
+            (const float *)raw_kv->ptr, (const float *)comp_kv->ptr,
+            topk_ptr, n_tokens, pos0, n_raw, raw_cap, raw_start,
+            n_comp, top_k, window, ratio, n_head, head_dim);
+        return cuda_ok(cudaGetLastError(), "attention indexed cached query launch");
+    }
+    attention_indexed_mixed_kernel<><<<grid, 256>>>((float *)heads->ptr,
                                                   sinks,
                                                   (const float *)q->ptr,
                                                   (const float *)raw_kv->ptr,
@@ -25411,7 +26051,7 @@ static int routed_moe_launch(
     /* The lockstep TP drafter: with sharding armed the support map's experts
      * must come from its split.  Suspended (single-rank drafting) keeps the
      * raw experts, which stay resident for the leader's own drafter. */
-    if (iq2_path && g_dspark_tp_split_active && model_map == g_dspark_tp_split_map &&
+    if ((iq2_path || mxfp4_path) && g_dspark_tp_split_active && model_map == g_dspark_tp_split_map &&
         g_network_tp_rank >= 0 && !g_network_tp_sharding_suspended) {
         split_gate = owned_filtered ? NULL :
             cuda_tp_split_ptr(model_map, gate_offset, CUDA_DERIVED_DSPARK_TP_ROWS);

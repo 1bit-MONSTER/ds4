@@ -207,8 +207,8 @@ uint64_t ds4_gpu_build_mxfp4_tp_split(
         const uint32_t *n_experts,
         uint32_t        count);
 void ds4_gpu_release_mxfp4_tp_split(void);
-/* The same split of the DSpark drafter's IQ2_XXS gate/up and Q2_K down
- * experts for the lockstep TP drafter; types holds each tensor's type. */
+/* The same split for the lockstep DSpark drafter: IQ2_XXS gate/up and Q2_K
+ * down, or native MXFP4 experts. types holds each tensor's type. */
 uint64_t ds4_gpu_build_dspark_tp_split(
         const void     *model_map,
         uint64_t        model_size,

@@ -24,7 +24,7 @@ HELPERS = (
     "dspark_eval_confidence0_runtime",
     "dspark_apply_markov_confidence_lazy_runtime",
 )
-# Present after the fix; the HEAD layout reads batch_ffn_norm directly.
+# Also accept sources that inline the confidence-row selection.
 OPTIONAL_HELPERS = ("metal_graph_dspark_confidence_hidden",)
 DRIVER = "ds4_session_prepare_dspark_draft_impl"
 

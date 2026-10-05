@@ -471,6 +471,36 @@ tests/test_cuda_reductions: tests/test_cuda_reductions.o ds4_cuda.o ds4_image.o 
 test-cuda-reductions: tests/test_cuda_reductions
 	./tests/test_cuda_reductions
 
+tests/test_cuda_indexer.o: tests/test_cuda_indexer.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_indexer: tests/test_cuda_indexer.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-indexer
+test-cuda-indexer: tests/test_cuda_indexer
+	./tests/test_cuda_indexer
+
+tests/test_cuda_f16_chunks.o: tests/test_cuda_f16_chunks.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_f16_chunks: tests/test_cuda_f16_chunks.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-f16-chunks
+test-cuda-f16-chunks: tests/test_cuda_f16_chunks
+	./tests/test_cuda_f16_chunks
+
+tests/test_cuda_indexed_one.o: tests/test_cuda_indexed_one.cu ds4_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_indexed_one: tests/test_cuda_indexed_one.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-indexed-one
+test-cuda-indexed-one: tests/test_cuda_indexed_one
+	./tests/test_cuda_indexed_one
+
 tests/test_cuda_hc_norm.o: tests/test_cuda_hc_norm.cu ds4_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
 
@@ -574,10 +604,37 @@ tests/test_cuda_dspark_tp_markov: tests/test_cuda_dspark_tp_markov.o ds4_cuda.o 
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 .PHONY: test-cuda-dspark-tp
-test-cuda-dspark-tp: tests/test_cuda_dspark_tp_markov tests/test_cuda_dspark_tp_split tests/test_cuda_shared_side
+test-cuda-dspark-tp: tests/test_cuda_dspark_tp_markov tests/test_cuda_dspark_tp_split \
+    tests/test_cuda_shared_side tests/test_cuda_f16_chunks tests/test_cuda_topk_stream \
+    tests/test_cuda_indexed_one tests/test_cuda_embed tests/test_cuda_hc_norm \
+    tests/test_cuda_hc_pre tests/test_cuda_indexer tests/test_cuda_q8_pair
 	./tests/test_cuda_dspark_tp_markov
 	./tests/test_cuda_dspark_tp_split
+	./tests/test_cuda_dspark_tp_split --mxfp4
 	./tests/test_cuda_shared_side
+	./tests/test_cuda_f16_chunks
+	./tests/test_cuda_topk_stream
+	./tests/test_cuda_indexed_one
+	./tests/test_cuda_embed
+	./tests/test_cuda_hc_norm
+	./tests/test_cuda_hc_pre
+	./tests/test_cuda_indexer
+	./tests/test_cuda_q8_pair
+
+.PHONY: test-dspark-history
+test-dspark-history:
+	python3 tests/test_dspark_window.py
+	python3 tests/test_dspark_confidence_input.py
+
+tests/test_cuda_topk_stream.o: tests/test_cuda_topk_stream.cu ds4_gpu.h ds4_deepseek41_gpu.h
+	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
+
+tests/test_cuda_topk_stream: tests/test_cuda_topk_stream.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+
+.PHONY: test-cuda-topk-stream
+test-cuda-topk-stream: tests/test_cuda_topk_stream
+	./tests/test_cuda_topk_stream
 
 tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(CFLAGS) -I. -c -o $@ $<
@@ -1272,6 +1329,9 @@ clean:
 	rm -f tests/test_cuda_q8_rows
 	rm -f tests/test_cuda_q8_pair
 	rm -f tests/test_cuda_reductions
+	rm -f tests/test_cuda_indexer
+	rm -f tests/test_cuda_f16_chunks
+	rm -f tests/test_cuda_indexed_one
 	rm -f tests/test_cuda_hc_norm
 	rm -f tests/test_cuda_hc_pre
 	rm -f tests/test_cuda_copy_spans
@@ -1284,6 +1344,7 @@ clean:
 	rm -f tests/test_cuda_dspark_tp_markov
 	rm -f tests/test_cuda_attn_side
 	rm -f tests/test_mxfp4_staged_cuda
+	rm -f tests/test_cuda_topk_stream
 	rm -f tests/test_cuda_ssd_cache
 	rm -f tests/test_cuda_ssd_batch
 	rm -f tests/test_cuda_embed

@@ -2,7 +2,8 @@
  * quantized activations (ds4_mmq_q8_0_dense_preq) in every bit: random,
  * NaN/Inf and huge activations, zero/Inf/NaN weight scales; the exact GEMV
  * shapes (q_b: K 1024, M 16384; q_a and kv: K 4096, M 1024 and 512; 2..8
- * columns) and shapes they decline (1 and 9 columns, other and partial row
+ * columns; vocabulary head: K 4096, M 64640, 5/6/8 columns) and shapes
+ * they decline (1 and 9 columns, other and partial row
  * counts); on a non-blocking stream behind the activation producer; and
  * captured in a CUDA graph replayed with new activations.  On Spark the
  * graph of an exact shape must hold two kernels (quantize and the GEMV), not
@@ -94,20 +95,22 @@ int main(int argc, char **argv) {
     const bool spark = prop.major * 100 + prop.minor * 10 == 1210;
     bufs b;
     CUDA_CHECK(cudaMalloc(&b.x, (size_t)MAX_N * 4096 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&b.ref, (size_t)MAX_N * 32768 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&b.out, (size_t)MAX_N * 32768 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.ref, (size_t)MAX_N * 64640 * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&b.out, (size_t)MAX_N * 64640 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&b.y, Y_MAX));
 
-    /* The exact shapes (q_b, q_a, kv) and shapes they decline, eager on the
+    /* The exact shapes (q_b, q_a, kv, head) and shapes they decline, eager on the
      * legacy stream. */
     struct shape { int M, K; };
-    const shape admitted[] = {{16384, 1024}, {1024, 4096}, {512, 4096}};
+    const shape admitted[] = {{16384, 1024}, {1024, 4096}, {512, 4096}, {64640, 4096}};
     const shape shapes[] = {{16384, 1024}, {1024, 4096}, {512, 4096},
-                            {16256, 1024}, {16320, 1024}, {32768, 1024}, {2048, 4096}, {16384, 4096}};
+                            {16256, 1024}, {16320, 1024}, {32768, 1024}, {2048, 4096}, {16384, 4096},
+                            {64640, 4096}, {64512, 4096}, {64639, 4096}};
     unsigned checked = 0;
     for (const shape &s : shapes) {
         uint8_t *w = make_weights(s.M, s.K);
-        const bool exact_shape = (s.M == 16384 && s.K == 1024) || (s.K == 4096 && (s.M == 1024 || s.M == 512));
+        const bool exact_shape = (s.M == 16384 && s.K == 1024) ||
+            (s.K == 4096 && (s.M == 1024 || s.M == 512 || s.M == 64640));
         for (int N = 1; N <= MAX_N; N++) {
             if (!exact_shape && N != 6) continue;
             for (int round = 0; round < 3; round++) {
@@ -122,8 +125,8 @@ int main(int argc, char **argv) {
         }
         CUDA_CHECK(cudaFree(w));
     }
-    printf("q8_0 gemv: %u eager cases equal to mul_mat_q in every bit (M 16384 K 1024, M 1024 / 512 K 4096: "
-           "N 1..9; M 16256 / 16320 / 32768 K 1024 and M 2048 / 16384 K 4096 declined)\n", checked);
+    printf("q8_0 gemv: %u eager cases equal to mul_mat_q in every bit, "
+           "including vocabulary head and declined shapes\n", checked);
 
     cudaStream_t s;
     CUDA_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
@@ -179,7 +182,8 @@ int main(int argc, char **argv) {
                 CUDA_CHECK(cudaGraphNodeGetType(n, &t));
                 kernels += t == cudaGraphNodeTypeKernel;
             }
-            if (spark) CHECK(kernels == 2);
+            const bool head_on = M == 64640 && (N == 5 || N == 6 || N == 8);
+            if (spark && (M != 64640 || head_on)) CHECK(kernels == 2);
             else CHECK(kernels >= 3);
             CUDA_CHECK(cudaGraphInstantiate(&exec, graph, 0));
             for (int round = 0; round < 3; round++) {
@@ -195,8 +199,8 @@ int main(int argc, char **argv) {
             CUDA_CHECK(cudaGraphExecDestroy(exec));
             CUDA_CHECK(cudaGraphDestroy(graph));
         }
-        printf("q8_0 gemv: M %d K %d, N 2..8 captured in a CUDA graph (%s), 3 replays with new activations equal\n",
-               M, K, spark ? "quantize + exact GEMV" : "mul_mat_q chain");
+        printf("q8_0 gemv: M %d K %d, N 2..8 captured in a CUDA graph, "
+               "3 replays with new activations equal\n", M, K);
         CUDA_CHECK(cudaFree(w));
     }
 

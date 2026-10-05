@@ -700,7 +700,7 @@ union ds4_q8_gemv4_segs {
 static_assert(sizeof(((ds4_q8_gemv4_segs *)nullptr)->t) <= sizeof(((ds4_q8_gemv4_segs *)nullptr)->w),
               "the word view covers the table");
 
-template <int ncols>
+template <int ncols, bool full_row = false>
 __global__ static void __launch_bounds__(DS4_Q8_GEMV_WARPS * WARP_SIZE)
 ds4_mmq_q8_0_exact_gemv4_kernel(const block_q8_0 * __restrict__ W, const block_q8_1_mmq * __restrict__ Y,
                                 float * __restrict__ out, const int M, const ds4_q8_gemv4_segs segs_param) {
@@ -715,7 +715,7 @@ ds4_mmq_q8_0_exact_gemv4_kernel(const block_q8_0 * __restrict__ W, const block_q
     const int lane = threadIdx.x % WARP_SIZE, warp = threadIdx.x / WARP_SIZE;
     const int slot = warp / chunks, chunk = warp % chunks;
     if (lane == 0) stage[warp][DS4_Q8_GEMV_ROW_U4] = make_uint4(0, 0, 0, 0);
-    if (threadIdx.x == 0) {
+    if (!full_row && threadIdx.x == 0) {
 #pragma unroll
         for (int i = 0; i < seg_words; i++) segs.w[i] = segs_param.w[i];
     }
@@ -770,29 +770,43 @@ ds4_mmq_q8_0_exact_gemv4_kernel(const block_q8_0 * __restrict__ W, const block_q
         s_da[slot][b] = __half2float(__ushort_as_half(dbits));
         __syncthreads();
 
-        /* The row's 128 lanes: one (column, segment) chain each, ascending. */
-        const int tile = row / DS4_Q8_GEMV_MMQ_Y, nseg = segs.t.nseg[tile];
-        {
-            const int k = chunk * WARP_SIZE + lane, c = k % ncols, s = k / ncols;
-            if (c < ncols && s < nseg && row < M) {
+        if constexpr (full_row) {
+            /* With one MMQ CTA per row tile there is no stream-K fixup:
+             * each output accumulates all 128 block products in order. */
+            if (chunk == 0 && lane < ncols && row < M) {
                 float sum = 0.0f;
-                for (int bb = segs.t.bound[tile][s]; bb < segs.t.bound[tile][s + 1]; bb++)
-                    sum = __fmaf_rn(__fmul_rn(s_c[slot][c][bb], s_da[slot][bb]), s_db[c][bb], sum);
-                s_part[slot][c][s] = sum;
+                for (int bb = 0; bb < blocks; bb++) {
+                    sum = __fmaf_rn(__fmul_rn(s_c[slot][lane][bb], s_da[slot][bb]),
+                                   s_db[lane][bb], sum);
+                }
+                out[(size_t)lane * M + row] = isfinite(sum) ? sum : 0.0f;
             }
-        }
-        __syncthreads();
+            __syncthreads();
+        } else {
+            /* The row's 128 lanes: one (column, segment) chain each, ascending. */
+            const int tile = row / DS4_Q8_GEMV_MMQ_Y, nseg = segs.t.nseg[tile];
+            {
+                const int k = chunk * WARP_SIZE + lane, c = k % ncols, s = k / ncols;
+                if (c < ncols && s < nseg && row < M) {
+                    float sum = 0.0f;
+                    for (int bb = segs.t.bound[tile][s]; bb < segs.t.bound[tile][s + 1]; bb++)
+                        sum = __fmaf_rn(__fmul_rn(s_c[slot][c][bb], s_da[slot][bb]), s_db[c][bb], sum);
+                    s_part[slot][c][s] = sum;
+                }
+            }
+            __syncthreads();
 
-        /* The end CTA's sum plus the earlier ones from 0, descending (the
-         * fixup), then the sanitize. */
-        if (chunk == 0 && lane < ncols && row < M) {
-            float v = s_part[slot][lane][nseg - 1];
-            if (nseg > 1) {
-                float fix = 0.0f;
-                for (int s = nseg - 2; s >= 0; s--) fix += s_part[slot][lane][s];
-                v += fix;
+            /* The end CTA's sum plus the earlier ones from 0, descending (the
+             * fixup), then the sanitize. */
+            if (chunk == 0 && lane < ncols && row < M) {
+                float v = s_part[slot][lane][nseg - 1];
+                if (nseg > 1) {
+                    float fix = 0.0f;
+                    for (int s = nseg - 2; s >= 0; s--) fix += s_part[slot][lane][s];
+                    v += fix;
+                }
+                out[(size_t)lane * M + row] = isfinite(v) ? v : 0.0f;
             }
-            out[(size_t)lane * M + row] = isfinite(v) ? v : 0.0f;
         }
 #pragma unroll
         for (int j = 0; j < 3; j++) cur[j] = next[j];
@@ -854,6 +868,9 @@ static int ds4_mmq_q8_0_exact_gemv4_blocks(int dev) {
             (void)cudaGetLastError();
             n = -1;
         }
+        /* Limit the six-row grid to leave scheduling room for the
+         * concurrent compressor/indexer work. */
+        if (ncols == 6 && n > 2) n = 2;
         per_sm[dev] = n;
     }
     return per_sm[dev] > 0 ? per_sm[dev] * ggml_cuda_info().devices[dev].nsm : 0;
@@ -893,8 +910,44 @@ static void ds4_mmq_q8_0_exact_gemv4(const void *W, const void *Y, float *out, i
     }
 }
 
-/* The measured shapes only (Spark, the TP rank's attention projections:
- * q_b, q_a, kv): everything else stays on mul_mat_q. */
+template <int ncols>
+static int ds4_mmq_q8_0_head_blocks(int dev) {
+    static int per_sm[GGML_CUDA_MAX_DEVICES] = {};
+    if (per_sm[dev] == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n,
+                ds4_mmq_q8_0_exact_gemv4_kernel<ncols, true>,
+                DS4_Q8_GEMV_WARPS * WARP_SIZE, 0) != cudaSuccess || n <= 0) {
+            (void)cudaGetLastError();
+            n = -1;
+        }
+        per_sm[dev] = n;
+    }
+    return per_sm[dev] > 0 ? per_sm[dev] * ggml_cuda_info().devices[dev].nsm : 0;
+}
+
+static bool ds4_mmq_q8_0_head_ok(int dev, int M, int N) {
+    if (M != 64640 || (N != 5 && N != 6 && N != 8) || M % DS4_Q8_GEMV_MMQ_Y != 0) return false;
+    const int nsm = ggml_cuda_info().devices[dev].nsm;
+    if (nsm <= 0) return false;
+    const int tiles = M / DS4_Q8_GEMV_MMQ_Y;
+    const int waves = (tiles + nsm - 1) / nsm;
+    if (100 * tiles / (nsm * waves) < 90) return false;
+    return (N == 5 ? ds4_mmq_q8_0_head_blocks<5>(dev) :
+            N == 6 ? ds4_mmq_q8_0_head_blocks<6>(dev) : ds4_mmq_q8_0_head_blocks<8>(dev)) > 0;
+}
+
+template <int ncols>
+static void ds4_mmq_q8_0_head_launch(const void *W, const void *Y, float *out, int M, int dev,
+                                    cudaStream_t stream) {
+    ds4_q8_gemv4_segs unused = {};
+    ds4_mmq_q8_0_exact_gemv4_kernel<ncols, true><<<ds4_mmq_q8_0_head_blocks<ncols>(dev),
+            DS4_Q8_GEMV_WARPS * WARP_SIZE, 0, stream>>>(
+            (const block_q8_0 *)W, (const block_q8_1_mmq *)Y, out, M, unused);
+}
+
+/* The measured Spark TP shapes only: attention projections and vocabulary
+ * head. Everything else stays on mul_mat_q. */
 static bool ds4_mmq_q8_0_exact_gemv_ok(int dev, const void *W, int M, int N, int K) {
     if (ggml_cuda_info().devices[dev].cc != GGML_CUDA_CC_DGX_SPARK ||
         get_mmq_y_host(GGML_CUDA_CC_DGX_SPARK) != DS4_Q8_GEMV_MMQ_Y ||
@@ -902,6 +955,7 @@ static bool ds4_mmq_q8_0_exact_gemv_ok(int dev, const void *W, int M, int N, int
         return false;
     }
     if (K == DS4_Q8_GEMV_K && M == 16384) return ds4_mmq_q8_0_exact_gemv_blocks(dev, N) > 0;
+    if (K == 4096 && ds4_mmq_q8_0_head_ok(dev, M, N)) return true;
     if (K == 4096 && (M == 1024 || M == 512)) {
         return ds4_q8_gemv4_segments(dev, M) != nullptr && ds4_mmq_q8_0_exact_gemv4_blocks(dev, N) > 0;
     }
@@ -1067,7 +1121,11 @@ int ds4_mmq_dense_impl(
         if (out_memset_enabled()) {
             (void)cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
         }
-        if (K == 4096) ds4_mmq_q8_0_exact_gemv4(W, src1_q8_1, out_f32, M, N, dev, stream);
+        if (K == 4096 && M == 64640) {
+            if (N == 5) ds4_mmq_q8_0_head_launch<5>(W, src1_q8_1, out_f32, M, dev, stream);
+            else if (N == 6) ds4_mmq_q8_0_head_launch<6>(W, src1_q8_1, out_f32, M, dev, stream);
+            else ds4_mmq_q8_0_head_launch<8>(W, src1_q8_1, out_f32, M, dev, stream);
+        } else if (K == 4096) ds4_mmq_q8_0_exact_gemv4(W, src1_q8_1, out_f32, M, N, dev, stream);
         else ds4_mmq_q8_0_exact_gemv(W, src1_q8_1, out_f32, M, N, dev, stream);
         err = cudaGetLastError();
         if (err != cudaSuccess) {
