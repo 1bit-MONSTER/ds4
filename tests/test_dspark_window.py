@@ -33,7 +33,7 @@ HELPERS = (
 
 
 def extract(source, name):
-    matches = list(re.finditer(r"static (?:void|bool) " + re.escape(name) + r"\s*\(", source))
+    matches = list(re.finditer(r"static (?:void|bool|int) " + re.escape(name) + r"\s*\(", source))
     if len(matches) != 1:
         raise ValueError("require exactly one production helper: " + name)
     start = matches[0].start()
@@ -387,13 +387,30 @@ def contracts(source):
     for gone in ("gfx1151_reference_alignment", "align_rocm", "claim_appended_row"):
         check("no " + gone, gone not in source)
     driver = find_body(source, "ds4_session_prepare_dspark_draft_impl")
-    order = [driver.find(token) for token in (
+    # The TP branch chooses DRAFT/MAINTAIN before entering its own cache
+    # helper. The local path below it must still merge before checking skip.
+    local_start = driver.find("const uint32_t feature_pos = pos - 1u;")
+    local = driver[local_start:] if local_start >= 0 else ""
+    order = [local.find(token) for token in (
         "metal_graph_seed_dspark_initial_cache_from_prefill(",
         "metal_graph_dspark_cache_target_prefix(",
         "ds4_session_dspark_scheduler_should_skip(",
         "metal_graph_dspark_ring_maintain(")]
-    check("driver merges pending capture, crops, then skips or drafts",
+    check("local driver merges pending capture, crops, then skips or drafts",
           min(order) >= 0 and order == sorted(order))
+    tp = find_body(source, "ds4_session_dspark_tp_step")
+    order = [tp.find(token) for token in (
+        "metal_graph_seed_dspark_initial_cache_from_prefill(",
+        "metal_graph_dspark_cache_target_prefix(",
+        "if (mode == DS4_TP_DSPARK_MAINTAIN)",
+        "metal_graph_dspark_ring_maintain(",
+        "metal_graph_eval_dspark_stage_chain(")]
+    check("TP step merges pending capture and crops before maintaining or drafting",
+          min(order) >= 0 and order == sorted(order))
+    check("TP driver runs the cache helper for both draft and maintain",
+          "tp_draft && !skip ? DS4_TP_DSPARK_DRAFT : DS4_TP_DSPARK_MAINTAIN" in driver and
+          "ds4_session_dspark_tp_step(s, token, pos, mode," in driver and
+          "if (tp_draft && !skip)" not in driver)
     check("driver pairs t[pos] with h[pos-1]", "const uint32_t feature_pos = pos - 1u;" in driver)
     initial = find_body(source, "metal_graph_seed_dspark_initial_cache_from_prefill")
     check("prefill/verifier capture merges into history",

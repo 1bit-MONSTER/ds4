@@ -39,8 +39,46 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-/* Two-slot verification slabs and per-block graph negotiation. */
-#define DS4_TP_PROTOCOL_VERSION 15u
+/* 17: RDMA command mailbox and verify-block begin records in the slab tail.
+ * 18: VERIFY flags (verify-head vocab split), small exchange and head-row
+ *     records in the slab tail.
+ * 19: DSpark drafter agreement, draft commands and proposal-check flags.
+ * 20: VERIFY_COMMIT uses the command mailbox when negotiated. */
+#define DS4_TP_PROTOCOL_VERSION 20u
+
+/* Leader -> worker command mailbox.  Command frames are written with RDMA
+ * WRITE into a ring in the worker's slab and polled from host memory, so
+ * the latency-critical ones (VERIFY, EVAL) skip the kernel TCP receive path.
+ * A record holds a whole frame, or a marker saying the frame follows on the
+ * TCP control channel (large payloads), so command order is the ring order.
+ * Each record ends with its sequence number, written by a second RDMA WRITE
+ * after the body; the RC queue pair places the two in order. */
+#define DS4_TP_MBOX_SLOTS 64u
+#define DS4_TP_MBOX_SLOT_BYTES 4096u
+#define DS4_TP_MBOX_SEQ_OFF (DS4_TP_MBOX_SLOT_BYTES - 8u)
+#define DS4_TP_MBOX_FRAME_TCP UINT32_C(0x4d424f58) /* "MBOX": frame is on TCP */
+#define DS4_TP_MBOX_ACK_EVERY 16u
+#define DS4_TP_MBOX_RING_BYTES ((uint64_t)DS4_TP_MBOX_SLOTS * DS4_TP_MBOX_SLOT_BYTES)
+/* Begin records: two parity slots per direction (in, out staging), 64 bytes,
+ * sequence at byte 56; then the credit word (in) and its staging (out). */
+#define DS4_TP_BEGIN_REC_BYTES 64u
+#define DS4_TP_BEGIN_SEQ_OFF 56u
+#define DS4_TP_MBOX_TAIL_BYTES (2u * DS4_TP_MBOX_RING_BYTES + \
+                                4u * DS4_TP_BEGIN_REC_BYTES + 2u * 64u)
+/* Small symmetric exchange records (two parity slots per direction) and one
+ * worker -> leader float row (verify-head vocab split), also in the slab
+ * tail.  Each ends with an 8-byte sequence word written after the body. */
+#define DS4_TP_XCHG_REC_BYTES 256u
+#define DS4_TP_XCHG_DATA_OFF 8u    /* after a uint32_t byte count */
+#define DS4_TP_XCHG_SEQ_OFF (DS4_TP_XCHG_REC_BYTES - 8u)
+/* Head row record: {uint32_t floats, uint32_t row, uint64_t block} header,
+ * the floats, then the sequence word, which is the verify block id. */
+#define DS4_TP_HEAD_ROW_DATA_OFF 16u
+#define DS4_TP_HEAD_ROW_SEQ_OFF (DS4_TP_HEAD_ROW_DATA_OFF + (uint64_t)DS4_TP_HEAD_ROW_MAX * sizeof(float))
+#define DS4_TP_HEAD_ROW_BYTES (DS4_TP_HEAD_ROW_SEQ_OFF + 64u)
+#define DS4_TP_HEAD_TAIL_BYTES (4u * DS4_TP_XCHG_REC_BYTES + 2u * DS4_TP_HEAD_ROW_BYTES)
+/* Spin this long waiting for a command before falling back to 1 ms polls. */
+#define DS4_TP_MBOX_SPIN_MS 50u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -83,6 +121,7 @@ typedef struct {
     uint8_t gid[16];
     uint8_t link_layer;
     uint8_t reliable;
+    uint8_t mailbox;            /* offers the slab-tail command mailbox */
 } ds4_tp_rdma_info;
 
 /* TCP gate frames carry a small header so a desynchronized pair fails loudly
@@ -142,6 +181,7 @@ typedef struct {
 #define DS4_TP_RDMA_BULK_SLOTS 64
 #define DS4_TP_RDMA_BULK_WR_TAG (UINT64_C(1) << 63)
 #define DS4_TP_RDMA_BLOCK_WR_TAG (UINT64_C(1) << 61)
+#define DS4_TP_RDMA_MBOX_WR_TAG (UINT64_C(1) << 60)
 
 typedef struct {
     ds4_tp_verbs_api api;
@@ -177,6 +217,13 @@ typedef struct {
     uint32_t block_layers;
     uint32_t block_posted;      /* layers whose receives are posted */
     uint64_t block_recv_done;   /* row messages received in this block */
+    /* Command mailbox and begin records (both peers offered them). */
+    bool mbox_active;
+    uint64_t mbox_sent;         /* leader: records written */
+    uint64_t mbox_consumed;     /* worker: records taken */
+    uint64_t mbox_acked;        /* worker: last credit written back */
+    uint64_t begin_count;       /* verify blocks begun (both ranks) */
+    uint64_t xchg_count;        /* small exchanges (both ranks) */
 } ds4_tp_rdma;
 
 static uint32_t tp_rdma_negotiate_max_msg(uint32_t local, uint32_t peer) {
@@ -215,6 +262,16 @@ struct ds4_tp {
     uint64_t gpu_flags_off;     /* GPU-written gate-ready flags (u32/slot) */
     uint64_t batch_out_off;     /* [layer][row] verify-block local partials */
     uint64_t batch_in_off;      /* [layer][row] verify-block peer partials */
+    uint64_t mbox_in_off;       /* command ring written by the leader */
+    uint64_t mbox_out_off;      /* local staging for outgoing records */
+    uint64_t begin_in_off;      /* peer begin records (2 parity slots) */
+    uint64_t begin_out_off;     /* local staging for begin records */
+    uint64_t credit_in_off;     /* worker's consumed count (on the leader) */
+    uint64_t credit_out_off;    /* local staging for the credit word */
+    uint64_t xchg_in_off;       /* peer small-exchange records (2 parity) */
+    uint64_t xchg_out_off;      /* local staging for them */
+    uint64_t head_row_in_off;   /* leader: the worker's head row */
+    uint64_t head_row_out_off;  /* worker: staging of its head row */
     uint64_t timeout_sec;
     uint64_t gate_timeout_ms;
     atomic_bool failed;
@@ -466,6 +523,27 @@ static int tp_send_frame(int fd, uint32_t type, const void *payload, uint32_t by
     return 1;
 }
 
+#ifdef DS4_TP_HAVE_VERBS
+static int tp_mbox_active(const ds4_tp *tp);
+static int tp_mbox_put(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes);
+static int tp_mbox_get(ds4_tp *tp, uint32_t *type, uint8_t **payload, uint32_t *bytes);
+#endif
+
+/* Leader -> worker frames consumed by the worker's command loop.  With the
+ * RDMA mailbox a frame that fits travels in the ring; a larger one sends a
+ * ring marker and then the frame on the TCP control channel, so the worker
+ * still takes commands strictly in order. */
+static int tp_send_command(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp_mbox_active(tp)) {
+        if (bytes <= DS4_TP_MBOX_SEQ_OFF - sizeof(ds4_tp_frame_header))
+            return tp_mbox_put(tp, type, payload, bytes);
+        if (!tp_mbox_put(tp, DS4_TP_MBOX_FRAME_TCP, NULL, 0)) return 0;
+    }
+#endif
+    return tp_send_frame(tp->control_fd, type, payload, bytes);
+}
+
 static int tp_read_frame_header(int fd, uint32_t *type, uint32_t *bytes) {
     ds4_tp_frame_header h;
     if (!tp_read_full(fd, &h, sizeof(h))) return 0;
@@ -665,7 +743,9 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
            (uint64_t)n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
-           DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           DS4_TP_BATCH_MAX_ROWS * vec * 2 + /* batch out+in */
+           DS4_TP_MBOX_TAIL_BYTES +         /* command mailbox */
+           DS4_TP_HEAD_TAIL_BYTES;          /* small exchange + head row */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -681,9 +761,19 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->batch_in_off = tp->batch_out_off +
                        (uint64_t)tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
                        DS4_TP_BATCH_MAX_ROWS * vec;
-    tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
-                     DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->mbox_in_off = tp->batch_in_off +
+                      (uint64_t)tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
+                      DS4_TP_BATCH_MAX_ROWS * vec;
+    tp->mbox_out_off = tp->mbox_in_off + DS4_TP_MBOX_RING_BYTES;
+    tp->begin_in_off = tp->mbox_out_off + DS4_TP_MBOX_RING_BYTES;
+    tp->begin_out_off = tp->begin_in_off + 2u * DS4_TP_BEGIN_REC_BYTES;
+    tp->credit_in_off = tp->begin_out_off + 2u * DS4_TP_BEGIN_REC_BYTES;
+    tp->credit_out_off = tp->credit_in_off + 64u;
+    tp->xchg_in_off = tp->credit_out_off + 64u;
+    tp->xchg_out_off = tp->xchg_in_off + 2u * DS4_TP_XCHG_REC_BYTES;
+    tp->head_row_in_off = tp->xchg_out_off + 2u * DS4_TP_XCHG_REC_BYTES;
+    tp->head_row_out_off = tp->head_row_in_off + DS4_TP_HEAD_ROW_BYTES;
+    tp->slab_bytes = tp->head_row_out_off + DS4_TP_HEAD_ROW_BYTES;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -1185,6 +1275,16 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     memcpy(mine.gid, r->gid.raw, 16);
     mine.link_layer = r->port.link_layer;
     mine.reliable = tp_rdma_qp_type() == IBV_QPT_RC;
+    /* Mailbox writes must never be dropped (reliable connections only), and
+     * the mailbox polls the completion queue from the posting thread, which
+     * is only race-free where gate exchanges run on that same thread: CUDA
+     * gates are synchronous on the encoding thread, Metal's run on a gate
+     * thread (Metal also only uses UC queue pairs). */
+#ifdef __APPLE__
+    mine.mailbox = 0;
+#else
+    mine.mailbox = mine.reliable && getenv("DS4_TP_DISABLE_RDMA_MAILBOX") == NULL;
+#endif
     if (!tp_send_frame(tp->control_fd, DS4_TP_FRAME_RDMA_INFO, &mine, sizeof(mine))) {
         tp_set_err(err, errlen, "tp rdma: info send failed");
         return 0;
@@ -1201,6 +1301,9 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
         tp_set_err(err, errlen, "tp rdma: incompatible queue-pair transport");
         return 0;
     }
+    r->mbox_active = mine.mailbox && r->peer.mailbox;
+    r->mbox_sent = r->mbox_consumed = r->mbox_acked = r->begin_count = 0;
+    r->xchg_count = 0;
     /* INIT -> RTR -> RTS with the exact recipe the driver accepts (same as
      * JACCL): MTU 1024 and GRH via the IPv4-mapped GID. */
     struct ibv_qp_attr a = {0};
@@ -1288,6 +1391,7 @@ static int tp_rdma_register_and_exchange(ds4_tp *tp, char *err, size_t errlen) {
     }
     if (getenv("DS4_TP_DISABLE_RDMA_WARMUP") == NULL &&
         !tp_rdma_warm_up(tp, err, errlen)) return 0;
+    if (r->mbox_active) fprintf(stderr, "ds4-tp: rdma command mailbox enabled\n");
     return 1;
 }
 
@@ -1356,6 +1460,272 @@ static int tp_rdma_drain_cq(ds4_tp *tp) {
             r->send_outstanding--;
         }
     }
+    return 1;
+}
+
+static int tp_mbox_active(const ds4_tp *tp) {
+    return tp->rdma_active && tp->rdma.mbox_active;
+}
+
+bool ds4_tp_command_mailbox_active(const ds4_tp *tp) {
+    return tp && tp_mbox_active(tp);
+}
+
+static uint64_t tp_slab_load_u64(const ds4_tp *tp, uint64_t off) {
+    return __atomic_load_n((const uint64_t *)(const void *)(tp->slab + off), __ATOMIC_ACQUIRE);
+}
+
+/* Send-queue room for mailbox writes: at most this many signaled requests
+ * outstanding (every request the mailbox posts is signaled and counted). */
+static uint32_t tp_mbox_send_limit(const ds4_tp_rdma *r) {
+    const uint32_t depth = r->send_depth ? r->send_depth : 256u;
+    return depth / 2u < 64u ? depth / 2u : 64u;
+}
+
+/* RDMA WRITE of [local_off, +body) to the same-sized region at remote_off in
+ * the peer slab, then of the 8-byte sequence word.  RC executes them in
+ * order, so a poller that sees the sequence also sees the body.  Both
+ * requests are signaled so send_outstanding counts send-queue occupancy
+ * exactly; before posting, completions are drained (bounded by the gate
+ * timeout) until the requests fit under tp_mbox_send_limit(). */
+static int tp_rdma_write_record(ds4_tp *tp, uint64_t local_off, uint64_t remote_off,
+                                uint32_t body, uint64_t seq_local_off,
+                                uint64_t seq_remote_off) {
+    ds4_tp_rdma *r = &tp->rdma;
+    struct ibv_sge sge[2];
+    struct ibv_send_wr wr[2];
+    memset(wr, 0, sizeof(wr));
+    uint32_t n = 0;
+    if (body) {
+        sge[n] = (struct ibv_sge) {
+            .addr = (uintptr_t)(tp->slab + local_off), .length = body, .lkey = r->mr->lkey,
+        };
+        wr[n].wr_id = DS4_TP_RDMA_MBOX_WR_TAG;
+        wr[n].sg_list = &sge[n];
+        wr[n].num_sge = 1;
+        wr[n].opcode = IBV_WR_RDMA_WRITE;
+        wr[n].send_flags = IBV_SEND_SIGNALED;
+        wr[n].wr.rdma.remote_addr = r->peer.slab_base + remote_off;
+        wr[n].wr.rdma.rkey = r->peer.rkey;
+        n++;
+    }
+    sge[n] = (struct ibv_sge) {
+        .addr = (uintptr_t)(tp->slab + seq_local_off), .length = 8, .lkey = r->mr->lkey,
+    };
+    wr[n].wr_id = DS4_TP_RDMA_MBOX_WR_TAG;
+    wr[n].sg_list = &sge[n];
+    wr[n].num_sge = 1;
+    wr[n].opcode = IBV_WR_RDMA_WRITE;
+    wr[n].send_flags = IBV_SEND_SIGNALED;
+    wr[n].wr.rdma.remote_addr = r->peer.slab_base + seq_remote_off;
+    wr[n].wr.rdma.rkey = r->peer.rkey;
+    if (n) wr[0].next = &wr[1];
+    n++;
+    /* The staged record and sequence were written by this CPU; make them
+     * visible before the device reads them. */
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    const uint32_t limit = tp_mbox_send_limit(r);
+    const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+    pthread_mutex_lock(&r->post_lock);
+    int ok = 1;
+    while (ok && r->send_outstanding + n > limit) {
+        ok = tp_rdma_drain_cq(tp);
+        if (ok && r->send_outstanding + n > limit && tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: rdma mailbox: %u sends still pending\n",
+                    r->send_outstanding);
+            ok = 0;
+        }
+    }
+    struct ibv_send_wr *bad = NULL;
+    const int rc = ok ? ibv_post_send(r->qp, wr, &bad) : -1;
+    if (rc == 0) r->send_outstanding += n;
+    pthread_mutex_unlock(&r->post_lock);
+    if (rc != 0) {
+        fprintf(stderr, "ds4-tp: rdma mailbox write failed: %s\n",
+                rc > 0 ? strerror(rc) : "send queue did not drain");
+        return 0;
+    }
+    return 1;
+}
+
+/* Waits until the slab word at off reaches want.  It spins first; with
+ * timeout_ms == 0 (the worker's idle command wait) it waits forever, napping
+ * in 1 ms polls of the control socket once DS4_TP_MBOX_SPIN_MS has passed.
+ * Every wait checks for a failed context and a closed peer. */
+static int tp_slab_wait_u64(ds4_tp *tp, uint64_t off, uint64_t want,
+                            uint64_t timeout_ms, const char *what) {
+    const double t0 = tp_now_sec();
+    bool nap = false;
+    for (uint32_t spins = 1; tp_slab_load_u64(tp, off) < want; spins++) {
+        if (!nap && (spins & 0x3fffu) != 0) {
+#if defined(__aarch64__)
+            __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+            continue;
+        }
+        if (ds4_tp_failed(tp)) {
+            fprintf(stderr, "ds4-tp: failed while waiting for %s\n", what);
+            return 0;
+        }
+        if (tp_peer_closed(tp)) {
+            /* The peer's last record can land together with its FIN. */
+            if (tp_slab_load_u64(tp, off) >= want) return 1;
+            fprintf(stderr, "ds4-tp: peer closed while waiting for %s\n", what);
+            return 0;
+        }
+        const double waited_ms = (tp_now_sec() - t0) * 1000.0;
+        if (timeout_ms != 0 && waited_ms > (double)timeout_ms) {
+            fprintf(stderr, "ds4-tp: timeout waiting for %s\n", what);
+            return 0;
+        }
+        if (timeout_ms == 0 && waited_ms > (double)DS4_TP_MBOX_SPIN_MS) nap = true;
+        if (nap) {
+            struct pollfd pfd = { .fd = tp->control_fd, .events = POLLIN };
+            (void)poll(&pfd, 1, 1);
+        }
+    }
+    return 1;
+}
+
+/* Waits (bounded by the gate timeout) until every send this rank posted has
+ * completed.  On RC a completed RDMA WRITE has been placed in the peer's
+ * memory, so the queue pair can then be destroyed without losing it. */
+static int tp_rdma_wait_sends(ds4_tp *tp, const char *what) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const double deadline = tp_now_sec() + (double)tp->gate_timeout_ms / 1000.0;
+    for (;;) {
+        pthread_mutex_lock(&r->post_lock);
+        const int ok = tp_rdma_drain_cq(tp);
+        const uint32_t pending = r->send_outstanding;
+        pthread_mutex_unlock(&r->post_lock);
+        if (!ok) return 0;
+        if (pending == 0) return 1;
+        if (tp_now_sec() > deadline) {
+            fprintf(stderr, "ds4-tp: %s: %u sends still pending\n", what, pending);
+            return 0;
+        }
+    }
+}
+
+/* Leader: append one record to the worker's command ring. */
+static int tp_mbox_put(ds4_tp *tp, uint32_t type, const void *payload, uint32_t bytes) {
+    ds4_tp_rdma *r = &tp->rdma;
+    if (bytes > DS4_TP_MBOX_SEQ_OFF - sizeof(ds4_tp_frame_header)) return 0;
+    const uint64_t seq = r->mbox_sent + 1u;
+    /* The worker returns credits every DS4_TP_MBOX_ACK_EVERY records. */
+    if (seq > DS4_TP_MBOX_SLOTS &&
+        !tp_slab_wait_u64(tp, tp->credit_in_off, seq - DS4_TP_MBOX_SLOTS,
+                          tp->timeout_sec * 1000u, "command mailbox credit")) return 0;
+    const uint64_t off = ((seq - 1u) % DS4_TP_MBOX_SLOTS) * DS4_TP_MBOX_SLOT_BYTES;
+    uint8_t *rec = tp->slab + tp->mbox_out_off + off;
+    const ds4_tp_frame_header h = { DS4_TP_MAGIC, type, bytes };
+    memcpy(rec, &h, sizeof(h));
+    if (bytes) memcpy(rec + sizeof(h), payload, bytes);
+    memcpy(rec + DS4_TP_MBOX_SEQ_OFF, &seq, sizeof(seq));
+    if (!tp_rdma_write_record(tp, tp->mbox_out_off + off, tp->mbox_in_off + off,
+                              (uint32_t)(sizeof(h) + bytes),
+                              tp->mbox_out_off + off + DS4_TP_MBOX_SEQ_OFF,
+                              tp->mbox_in_off + off + DS4_TP_MBOX_SEQ_OFF)) return 0;
+    r->mbox_sent = seq;
+    return 1;
+}
+
+/* Worker: take the next record in order (blocks until it arrives). */
+static int tp_mbox_get(ds4_tp *tp, uint32_t *type, uint8_t **payload, uint32_t *bytes) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uint64_t seq = r->mbox_consumed + 1u;
+    const uint64_t off = ((seq - 1u) % DS4_TP_MBOX_SLOTS) * DS4_TP_MBOX_SLOT_BYTES;
+    if (!tp_slab_wait_u64(tp, tp->mbox_in_off + off + DS4_TP_MBOX_SEQ_OFF, seq, 0,
+                          "command")) return 0;
+    if (tp_slab_load_u64(tp, tp->mbox_in_off + off + DS4_TP_MBOX_SEQ_OFF) != seq) {
+        fprintf(stderr, "ds4-tp: command mailbox record out of sequence (want %llu)\n",
+                (unsigned long long)seq);
+        return 0;
+    }
+    const uint8_t *rec = tp->slab + tp->mbox_in_off + off;
+    ds4_tp_frame_header h;
+    memcpy(&h, rec, sizeof(h));
+    if (h.magic != DS4_TP_MAGIC ||
+        h.bytes > DS4_TP_MBOX_SEQ_OFF - sizeof(ds4_tp_frame_header) ||
+        (h.type == DS4_TP_MBOX_FRAME_TCP && h.bytes != 0)) {
+        fprintf(stderr, "ds4-tp: bad command mailbox record %llu\n", (unsigned long long)seq);
+        return 0;
+    }
+    uint8_t *p = NULL;
+    if (h.bytes) {
+        p = malloc(h.bytes);
+        if (!p) return 0;
+        memcpy(p, rec + sizeof(h), h.bytes);
+    }
+    r->mbox_consumed = seq;
+    if (seq - r->mbox_acked >= DS4_TP_MBOX_ACK_EVERY) {
+        /* A pending credit WRITE may read this newer value. Credits only
+         * grow, and every record they cover has already been copied out. */
+        __atomic_store_n((uint64_t *)(void *)(tp->slab + tp->credit_out_off), seq,
+                         __ATOMIC_RELEASE);
+        if (!tp_rdma_write_record(tp, 0, 0, 0, tp->credit_out_off, tp->credit_in_off)) {
+            free(p);
+            return 0;
+        }
+        r->mbox_acked = seq;
+    }
+    *type = h.type;
+    *bytes = h.bytes;
+    *payload = p;
+    return 1;
+}
+
+/* Verify-block begin: each rank writes its shape record into the peer's
+ * parity slot (after posting its layer-0 receives) and spins on its own. */
+static int tp_begin_exchange(ds4_tp *tp, const uint32_t mine[4], uint32_t peer[4]) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uint64_t seq = ++r->begin_count;
+    const uint64_t slot = (seq & 1u) * DS4_TP_BEGIN_REC_BYTES;
+    uint8_t *out = tp->slab + tp->begin_out_off + slot;
+    memcpy(out, mine, 4u * sizeof(uint32_t));
+    memcpy(out + DS4_TP_BEGIN_SEQ_OFF, &seq, sizeof(seq));
+    if (!tp_rdma_write_record(tp, tp->begin_out_off + slot, tp->begin_in_off + slot,
+                              4u * sizeof(uint32_t),
+                              tp->begin_out_off + slot + DS4_TP_BEGIN_SEQ_OFF,
+                              tp->begin_in_off + slot + DS4_TP_BEGIN_SEQ_OFF) ||
+        !tp_slab_wait_u64(tp, tp->begin_in_off + slot + DS4_TP_BEGIN_SEQ_OFF, seq,
+                          tp->gate_timeout_ms, "verify-block begin")) return 0;
+    if (tp_slab_load_u64(tp, tp->begin_in_off + slot + DS4_TP_BEGIN_SEQ_OFF) != seq) {
+        fprintf(stderr, "ds4-tp: verify-block begin record out of sequence\n");
+        return 0;
+    }
+    memcpy(peer, tp->slab + tp->begin_in_off + slot, 4u * sizeof(uint32_t));
+    return 1;
+}
+
+/* Small symmetric exchange over slab records: both ranks write their bytes
+ * into the peer's parity slot and spin on their own. */
+static int tp_rdma_small_exchange(ds4_tp *tp, const void *mine, void *peer, uint32_t bytes) {
+    ds4_tp_rdma *r = &tp->rdma;
+    const uint64_t seq = ++r->xchg_count;
+    const uint64_t slot = (seq & 1u) * DS4_TP_XCHG_REC_BYTES;
+    uint8_t *out = tp->slab + tp->xchg_out_off + slot;
+    memcpy(out, &bytes, sizeof(bytes));
+    memcpy(out + DS4_TP_XCHG_DATA_OFF, mine, bytes);
+    memcpy(out + DS4_TP_XCHG_SEQ_OFF, &seq, sizeof(seq));
+    if (!tp_rdma_write_record(tp, tp->xchg_out_off + slot, tp->xchg_in_off + slot,
+                              DS4_TP_XCHG_DATA_OFF + bytes,
+                              tp->xchg_out_off + slot + DS4_TP_XCHG_SEQ_OFF,
+                              tp->xchg_in_off + slot + DS4_TP_XCHG_SEQ_OFF) ||
+        !tp_slab_wait_u64(tp, tp->xchg_in_off + slot + DS4_TP_XCHG_SEQ_OFF, seq,
+                          tp->gate_timeout_ms, "small exchange")) return 0;
+    const uint8_t *in = tp->slab + tp->xchg_in_off + slot;
+    uint32_t peer_bytes = 0;
+    memcpy(&peer_bytes, in, sizeof(peer_bytes));
+    if (tp_slab_load_u64(tp, tp->xchg_in_off + slot + DS4_TP_XCHG_SEQ_OFF) != seq ||
+        peer_bytes != bytes) {
+        fprintf(stderr, "ds4-tp: small exchange %llu out of sequence or %u bytes, expected %u\n",
+                (unsigned long long)seq, peer_bytes, bytes);
+        return 0;
+    }
+    memcpy(peer, in + DS4_TP_XCHG_DATA_OFF, bytes);
     return 1;
 }
 
@@ -1779,6 +2149,9 @@ static int tp_rdma_big_gate_exchange(ds4_tp *tp,
         out_mr = in_mr = r->mr;
     }
     if (!tp_rdma_ensure_work_requests(r)) return 0;
+    /* Bulk traffic budgets the whole send queue. Reap pending command
+     * records or credits first; no mailbox writes are posted in this loop. */
+    if (tp_mbox_active(tp) && !tp_rdma_wait_sends(tp, "big gate")) return 0;
     const uint32_t send_depth = r->send_depth ? r->send_depth : 256u;
     uint64_t off = 0;
     uint8_t tag = 1;
@@ -2132,10 +2505,32 @@ fail:
     return 0;
 }
 
+int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t errlen) {
+    if (!tp || ds4_tp_failed(tp)) return 0;
+    const uint32_t mine[2] = {DS4_TP_MAGIC, flags};
+    uint32_t peer[2];
+    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine))) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp execution mode exchange failed");
+        return 0;
+    }
+    if (peer[0] != mine[0] || peer[1] != flags ||
+        (flags & ~DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT) != 0) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
+                   "set DS4_CUDA_DISABLE_TP_EXPERT_SPLIT=1 on both ranks "
+                   "for 50/50 expert ownership",
+                   peer[1], flags);
+        return 0;
+    }
+    return 1;
+}
+
 int ds4_tp_attach_slab(ds4_tp *tp, void *base, char *err, size_t errlen) {
     tp->slab = base;
     memset(tp->slab + tp->in_flags_off, 0, (uint64_t)tp->n_slots * 8);
     memset(tp->slab + tp->token_off, 0, 16);
+    memset(tp->slab + tp->mbox_in_off, 0, DS4_TP_MBOX_TAIL_BYTES + DS4_TP_HEAD_TAIL_BYTES);
 #ifdef DS4_TP_HAVE_VERBS
     if (tp->rdma_active) {
         for (;;) {
@@ -2175,6 +2570,9 @@ void ds4_tp_detach_slab(ds4_tp *tp) {
 
 int ds4_tp_rank(const ds4_tp *tp) { return tp->rank; }
 bool ds4_tp_is_rdma(const ds4_tp *tp) { return tp->rdma_active; }
+#ifndef DS4_TP_HAVE_VERBS
+bool ds4_tp_command_mailbox_active(const ds4_tp *tp) { (void)tp; return false; }
+#endif
 uint32_t ds4_tp_peer_ctx(const ds4_tp *tp) { return tp->peer_ctx; }
 bool ds4_tp_failed(const ds4_tp *tp) {
     return tp && atomic_load_explicit(&tp->failed, memory_order_acquire);
@@ -2248,7 +2646,14 @@ int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
      * exchange both agrees the graph and proves the peer's receive is ready. */
     const uint32_t mine[4] = {DS4_TP_BATCH_MAGIC, rows, n_layers, *gates_per_layer};
     uint32_t peer[4];
-    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine)) ||
+#ifdef DS4_TP_HAVE_VERBS
+    const int exchanged = tp_mbox_active(tp) ?
+        tp_begin_exchange(tp, mine, peer) :
+        tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine));
+#else
+    const int exchanged = tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine));
+#endif
+    if (!exchanged ||
         peer[0] != mine[0] || peer[1] != rows || peer[2] != n_layers ||
         peer[3] < 1 || peer[3] > DS4_TP_BATCH_GATES_PER_LAYER) {
 #ifdef DS4_TP_HAVE_VERBS
@@ -2458,6 +2863,20 @@ typedef struct {
 } ds4_tp_eval_command;
 
 typedef struct {
+    uint64_t session_id;
+    int32_t token;
+    int32_t pos;
+    uint32_t mode;
+    uint32_t reserved;
+} ds4_tp_dspark_draft_command;
+
+/* A seed block is only meaningful for a lockstep-drafted proposal. */
+static bool tp_verify_flags_valid(uint32_t flags) {
+    return (flags & ~DS4_TP_VERIFY_FLAGS) == 0u &&
+           (!(flags & DS4_TP_VERIFY_DSPARK_SEED) || (flags & DS4_TP_VERIFY_DSPARK_TP));
+}
+
+typedef struct {
     uint32_t count;
     uint32_t reserved;
 } ds4_tp_batch_command_header;
@@ -2474,32 +2893,38 @@ typedef struct {
     uint32_t reserved;
 } ds4_tp_command_ack;
 
-static int tp_send_token_command(ds4_tp *tp, uint32_t type,
-                                 uint64_t session_id, const int *tokens,
-                                 uint32_t count) {
+static int tp_send_token_command_flags(ds4_tp *tp, uint32_t type,
+                                       uint64_t session_id, const int *tokens,
+                                       uint32_t count, uint32_t flags) {
     const uint64_t bytes64 = sizeof(ds4_tp_token_command_header) +
                              (uint64_t)count * sizeof(int32_t);
     if (!tp || (!tokens && count != 0) || bytes64 > UINT32_MAX) return 0;
     const uint32_t bytes = (uint32_t)bytes64;
     uint8_t *payload = malloc(bytes ? bytes : 1u);
     if (!payload) return 0;
-    ds4_tp_token_command_header h = { session_id, count, 0 };
+    ds4_tp_token_command_header h = { session_id, count, flags };
     memcpy(payload, &h, sizeof(h));
     int32_t *wire_tokens = (int32_t *)(payload + sizeof(h));
     for (uint32_t i = 0; i < count; i++) wire_tokens[i] = (int32_t)tokens[i];
-    const int ok = tp_send_frame(tp->control_fd, type, payload, bytes);
+    const int ok = tp_send_command(tp, type, payload, bytes);
     free(payload);
     return ok;
 }
 
+static int tp_send_token_command(ds4_tp *tp, uint32_t type,
+                                 uint64_t session_id, const int *tokens,
+                                 uint32_t count) {
+    return tp_send_token_command_flags(tp, type, session_id, tokens, count, 0);
+}
+
 int ds4_tp_send_session_create(ds4_tp *tp, uint64_t session_id, int ctx_size) {
     ds4_tp_value_command msg = { session_id, (int32_t)ctx_size, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_CREATE,
+    return tp_send_command(tp, DS4_TP_FRAME_SESSION_CREATE,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_session_destroy(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_SESSION_DESTROY,
+    return tp_send_command(tp, DS4_TP_FRAME_SESSION_DESTROY,
                          &session_id, sizeof(session_id));
 }
 
@@ -2560,7 +2985,7 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
         memcpy(p, embedding->data, (size_t)data_bytes);
         p += data_bytes;
     }
-    int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_SYNC_MULTIMODAL,
+    int ok = tp_send_command(tp, DS4_TP_FRAME_SYNC_MULTIMODAL,
                            payload, (uint32_t)bytes64);
     free(payload);
     return ok;
@@ -2569,24 +2994,24 @@ int ds4_tp_send_sync_multimodal(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
                      uint64_t seq, int token) {
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
+    return tp_send_command(tp, DS4_TP_FRAME_EVAL, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit) {
     if (limit < 1 || limit > 2) return 0;
     ds4_tp_eval_command msg = { session_id, seq, (int32_t)token, (uint32_t)limit };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
+    return tp_send_command(tp, DS4_TP_FRAME_GLM_MTP, &msg, sizeof(msg));
 }
 
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
     ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_REWIND,
+    return tp_send_command(tp, DS4_TP_FRAME_REWIND,
                          &msg, sizeof(msg));
 }
 
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_INVALIDATE,
+    return tp_send_command(tp, DS4_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
 }
 
@@ -2601,7 +3026,7 @@ int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
     ds4_tp_batch_command_header h = { count, 0 };
     memcpy(payload, &h, sizeof(h));
     memcpy(payload + sizeof(h), items, (size_t)count * sizeof(*items));
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_EVAL_BATCH,
+    const int ok = tp_send_command(tp, DS4_TP_FRAME_EVAL_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2629,7 +3054,7 @@ int ds4_tp_send_mixed_batch(ds4_tp *tp, uint64_t prefill_session_id,
         wire_tokens[i] = (int32_t)prompt[i];
     }
     memcpy(payload + sizeof(h) + prompt_bytes, items, (size_t)item_bytes);
-    const int ok = tp_send_frame(tp->control_fd, DS4_TP_FRAME_MIXED_BATCH,
+    const int ok = tp_send_command(tp, DS4_TP_FRAME_MIXED_BATCH,
                                  payload, bytes);
     free(payload);
     return ok;
@@ -2703,7 +3128,14 @@ int ds4_tp_sync_checkpoint(ds4_tp *tp, uint32_t point, int current, int total,
 }
 
 int ds4_tp_send_stop(ds4_tp *tp) {
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_STOP, NULL, 0);
+    if (!tp_send_command(tp, DS4_TP_FRAME_STOP, NULL, 0)) return 0;
+#ifdef DS4_TP_HAVE_VERBS
+    /* Callers free the context right after STOP.  Over TCP the kernel still
+     * delivers queued bytes after close; a mailbox STOP is an RDMA WRITE that
+     * must complete before the queue pair is destroyed. */
+    if (tp_mbox_active(tp)) return tp_rdma_wait_sends(tp, "stop");
+#endif
+    return 1;
 }
 
 void ds4_tp_command_free(ds4_tp_command *command) {
@@ -2736,6 +3168,7 @@ static int tp_command_decode_tokens(ds4_tp_command *command,
     command->session_id = h.session_id;
     command->tokens = tokens;
     command->n_tokens = h.count;
+    command->value = (int)h.reserved;   /* VERIFY flags (DS4_TP_VERIFY_*) */
     return 1;
 }
 
@@ -2817,17 +3250,28 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     memset(command, 0, sizeof(*command));
     command->type = DS4_TP_FRAME_ERROR;
     uint32_t ftype = 0, bytes = 0;
-    if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
-        tp_set_err(err, errlen, "tp: control channel closed");
-        return 0;
-    }
     uint8_t *payload = NULL;
-    if (bytes != 0) {
-        payload = malloc(bytes);
-        if (!payload || !tp_read_full(tp->control_fd, payload, bytes)) {
-            free(payload);
-            tp_set_err(err, errlen, "tp: truncated command frame");
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp_mbox_active(tp)) {
+        if (!tp_mbox_get(tp, &ftype, &payload, &bytes)) {
+            tp_set_err(err, errlen, "tp: command mailbox closed");
             return 0;
+        }
+    }
+    if (!tp_mbox_active(tp) || ftype == DS4_TP_MBOX_FRAME_TCP)
+#endif
+    {
+        if (!tp_read_frame_header(tp->control_fd, &ftype, &bytes)) {
+            tp_set_err(err, errlen, "tp: control channel closed");
+            return 0;
+        }
+        if (bytes != 0) {
+            payload = malloc(bytes);
+            if (!payload || !tp_read_full(tp->control_fd, payload, bytes)) {
+                free(payload);
+                tp_set_err(err, errlen, "tp: truncated command frame");
+                return 0;
+            }
         }
     }
     int ok = 1;
@@ -2835,6 +3279,13 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
     case DS4_TP_FRAME_SYNC:
     case DS4_TP_FRAME_VERIFY:
         ok = tp_command_decode_tokens(command, payload, bytes, err, errlen);
+        if (ok == 1 && (uint32_t)command->value != 0u &&
+            (ftype != DS4_TP_FRAME_VERIFY ||
+             !tp_verify_flags_valid((uint32_t)command->value))) {
+            tp_set_err(err, errlen, "tp: unknown token command flags 0x%x",
+                       (unsigned)command->value);
+            ok = 0;
+        }
         break;
     case DS4_TP_FRAME_SYNC_MULTIMODAL:
         ok = tp_command_decode_multimodal(tp, command, payload, bytes,
@@ -2868,6 +3319,21 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
         } else if (msg.reserved != 0) {
             ok = 0;
         }
+        break;
+    }
+    case DS4_TP_FRAME_DSPARK_DRAFT: {
+        ds4_tp_dspark_draft_command msg;
+        if (bytes != sizeof(msg)) { ok = 0; break; }
+        memcpy(&msg, payload, sizeof(msg));
+        if (msg.pos <= 0 || msg.token < 0 || msg.reserved != 0 ||
+            (msg.mode != DS4_TP_DSPARK_MAINTAIN && msg.mode != DS4_TP_DSPARK_DRAFT)) {
+            ok = 0;
+            break;
+        }
+        command->session_id = msg.session_id;
+        command->value = msg.token;
+        command->limit = msg.pos;
+        command->seq = msg.mode;
         break;
     }
     case DS4_TP_FRAME_EVAL_BATCH: {
@@ -2955,22 +3421,165 @@ int ds4_tp_recv_logits_half(ds4_tp *tp, float *half, uint32_t count) {
 
 int ds4_tp_send_verify(ds4_tp *tp, uint64_t session_id,
                        const int *drafts, uint32_t n) {
-    return tp_send_token_command(tp, DS4_TP_FRAME_VERIFY, session_id,
-                                 drafts, n);
+    return ds4_tp_send_verify_flags(tp, session_id, drafts, n, 0);
+}
+
+int ds4_tp_send_verify_flags(ds4_tp *tp, uint64_t session_id,
+                             const int *drafts, uint32_t n, uint32_t flags) {
+    if (!tp_verify_flags_valid(flags)) return 0;
+    return tp_send_token_command_flags(tp, DS4_TP_FRAME_VERIFY, session_id,
+                                       drafts, n, flags);
+}
+
+int ds4_tp_send_dspark_draft(ds4_tp *tp, uint64_t session_id, int token,
+                             int pos, uint32_t mode) {
+    if (pos <= 0 || token < 0 ||
+        (mode != DS4_TP_DSPARK_MAINTAIN && mode != DS4_TP_DSPARK_DRAFT)) return 0;
+    ds4_tp_dspark_draft_command msg = { session_id, (int32_t)token, (int32_t)pos, mode, 0 };
+    return tp_send_command(tp, DS4_TP_FRAME_DSPARK_DRAFT, &msg, sizeof(msg));
+}
+
+#define DS4_TP_DSPARK_MAGIC 0x54505344u /* "DSPT" */
+
+int ds4_tp_agree_dspark_split(ds4_tp *tp, bool mine_on, const void *meta,
+                              bool *agreed, bool *peer_on,
+                              char *err, size_t errlen) {
+    if (!tp || ds4_tp_failed(tp) || !meta || !agreed || !peer_on) return 0;
+    uint8_t mine[8u + DS4_TP_DSPARK_META_BYTES], peer[sizeof(mine)];
+    const uint32_t head[2] = { DS4_TP_DSPARK_MAGIC, mine_on ? 1u : 0u };
+    memcpy(mine, head, sizeof(head));
+    memcpy(mine + sizeof(head), meta, DS4_TP_DSPARK_META_BYTES);
+    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine))) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp DSpark split exchange failed");
+        return 0;
+    }
+    uint32_t peer_head[2];
+    memcpy(peer_head, peer, sizeof(peer_head));
+    if (peer_head[0] != DS4_TP_DSPARK_MAGIC || peer_head[1] > 1u) {
+        ds4_tp_mark_failed(tp);
+        tp_set_err(err, errlen, "tp DSpark split agreement malformed");
+        return 0;
+    }
+    *peer_on = peer_head[1] != 0u;
+    *agreed = false;
+    if (mine_on && *peer_on) {
+        if (memcmp(mine + sizeof(head), peer + sizeof(head),
+                   DS4_TP_DSPARK_META_BYTES) != 0) {
+            ds4_tp_mark_failed(tp);
+            tp_set_err(err, errlen, "tp DSpark split: the ranks loaded different "
+                       "support models or settings; use the same --mtp-model, or "
+                       "set DS4_TP_DISABLE_DSPARK_SPLIT=1 on both ranks");
+            return 0;
+        }
+        *agreed = true;
+    }
+    return 1;
+}
+
+int ds4_tp_small_exchange(ds4_tp *tp, const void *mine, void *peer, uint32_t bytes) {
+#ifdef DS4_TP_HAVE_VERBS
+    if (!tp || !mine || !peer || bytes == 0 || bytes > DS4_TP_SMALL_EXCHANGE_MAX ||
+        !tp_mbox_active(tp) || ds4_tp_failed(tp)) return 0;
+    const int ok = tp_rdma_small_exchange(tp, mine, peer, bytes);
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
+#else
+    (void)tp; (void)mine; (void)peer; (void)bytes;
+    return 0;
+#endif
+}
+
+float *ds4_tp_head_row_out(ds4_tp *tp) {
+    return tp && tp->slab ?
+        (float *)(void *)(tp->slab + tp->head_row_out_off + DS4_TP_HEAD_ROW_DATA_OFF) : NULL;
+}
+
+/* Head rows are keyed by the verify block (the begin-exchange count, equal
+ * on both ranks), so a row the leader did not read (it rolled the block
+ * back) can never be taken for a later block's. */
+typedef struct {
+    uint32_t floats;
+    uint32_t row;
+    uint64_t block;
+} ds4_tp_head_row_header;
+
+int ds4_tp_head_row_send(ds4_tp *tp, uint32_t row, uint32_t floats) {
+#ifdef DS4_TP_HAVE_VERBS
+    if (!tp || tp->rank != 1 || floats == 0 || floats > DS4_TP_HEAD_ROW_MAX ||
+        !tp_mbox_active(tp) || ds4_tp_failed(tp) || tp->rdma.begin_count == 0) return 0;
+    const ds4_tp_head_row_header h = { floats, row, tp->rdma.begin_count };
+    uint8_t *rec = tp->slab + tp->head_row_out_off;
+    memcpy(rec, &h, sizeof(h));
+    memcpy(rec + DS4_TP_HEAD_ROW_SEQ_OFF, &h.block, sizeof(h.block));
+    /* The caller wrote the floats into ds4_tp_head_row_out().  Waiting for
+     * the completion keeps the staging area free for the next row. */
+    const int ok = tp_rdma_write_record(tp, tp->head_row_out_off, tp->head_row_in_off,
+                                        DS4_TP_HEAD_ROW_DATA_OFF + floats * (uint32_t)sizeof(float),
+                                        tp->head_row_out_off + DS4_TP_HEAD_ROW_SEQ_OFF,
+                                        tp->head_row_in_off + DS4_TP_HEAD_ROW_SEQ_OFF) &&
+                   tp_rdma_wait_sends(tp, "head row");
+    if (!ok) ds4_tp_mark_failed(tp);
+    return ok;
+#else
+    (void)tp; (void)row; (void)floats;
+    return 0;
+#endif
+}
+
+int ds4_tp_head_row_recv(ds4_tp *tp, uint32_t row, float *dst, uint32_t floats) {
+#ifdef DS4_TP_HAVE_VERBS
+    if (!tp || tp->rank != 0 || !dst || floats == 0 || floats > DS4_TP_HEAD_ROW_MAX ||
+        !tp_mbox_active(tp) || ds4_tp_failed(tp) || tp->rdma.begin_count == 0) return 0;
+    const uint64_t block = tp->rdma.begin_count;
+    const uint64_t seq_off = tp->head_row_in_off + DS4_TP_HEAD_ROW_SEQ_OFF;
+    ds4_tp_head_row_header h = {0, 0, 0};
+    const int landed = tp_slab_wait_u64(tp, seq_off, block, tp->gate_timeout_ms, "head row");
+    if (landed) memcpy(&h, tp->slab + tp->head_row_in_off, sizeof(h));
+    if (!landed || tp_slab_load_u64(tp, seq_off) != block ||
+        h.block != block || h.row != row || h.floats != floats) {
+        fprintf(stderr, "ds4-tp: head row for block %llu row %u (%u floats) missing or wrong "
+                "(block %llu row %u, %u floats)\n",
+                (unsigned long long)block, row, floats,
+                (unsigned long long)h.block, h.row, h.floats);
+        ds4_tp_mark_failed(tp);
+        return 0;
+    }
+    memcpy(dst, tp->slab + tp->head_row_in_off + DS4_TP_HEAD_ROW_DATA_OFF,
+           (size_t)floats * sizeof(float));
+    return 1;
+#else
+    (void)tp; (void)row; (void)dst; (void)floats;
+    return 0;
+#endif
 }
 
 int ds4_tp_send_verify_commit(ds4_tp *tp, int32_t mode, int32_t token_count) {
     struct { int32_t mode; int32_t count; } msg = { mode, token_count };
-    return tp_send_frame(tp->control_fd, DS4_TP_FRAME_VERIFY_COMMIT,
-                         &msg, sizeof(msg));
+    return tp_send_command(tp, DS4_TP_FRAME_VERIFY_COMMIT, &msg, sizeof(msg));
 }
 
 int ds4_tp_recv_verify_commit(ds4_tp *tp, int32_t *mode, int32_t *token_count) {
     uint32_t type = 0, bytes = 0;
     struct { int32_t mode; int32_t count; } msg;
-    if (!tp_read_frame_header(tp->control_fd, &type, &bytes) ||
-        type != DS4_TP_FRAME_VERIFY_COMMIT || bytes != sizeof(msg) ||
-        !tp_read_full(tp->control_fd, &msg, sizeof(msg))) {
+    bool ok;
+#ifdef DS4_TP_HAVE_VERBS
+    if (tp_mbox_active(tp)) {
+        /* Consume the next command here, before returning to the worker
+         * loop. The following draft cannot overtake this commit. */
+        uint8_t *payload = NULL;
+        ok = tp_mbox_get(tp, &type, &payload, &bytes) &&
+             type == DS4_TP_FRAME_VERIFY_COMMIT && bytes == sizeof(msg);
+        if (ok) memcpy(&msg, payload, sizeof(msg));
+        free(payload);
+    } else
+#endif
+    {
+        ok = tp_read_frame_header(tp->control_fd, &type, &bytes) &&
+             type == DS4_TP_FRAME_VERIFY_COMMIT && bytes == sizeof(msg) &&
+             tp_read_full(tp->control_fd, &msg, sizeof(msg));
+    }
+    if (!ok) {
         fprintf(stderr, "ds4-tp: bad verify-commit frame (type %u bytes %u)\n",
                 type, bytes);
         return 0;
@@ -3201,9 +3810,17 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker GLM MTP: %s", err);
                 rc = 1;
             }
+        } else if (command.type == DS4_TP_FRAME_DSPARK_DRAFT) {
+            if (ds4_session_tp_dspark_draft(session, command.value, command.limit,
+                                            (uint32_t)command.seq,
+                                            err, sizeof(err)) != 0) {
+                ds4_log(stderr, DS4_LOG_ERROR, "tp worker DSpark draft: %s", err);
+                rc = 1;
+            }
         } else if (command.type == DS4_TP_FRAME_VERIFY) {
             int spec_rc = ds4_session_tp_spec_cycle(session, command.tokens,
                                                     (int)command.n_tokens,
+                                                    (uint32_t)command.value,
                                                     err, sizeof(err));
             if (spec_rc != 0) {
                 ds4_log(stderr, DS4_LOG_ERROR, "tp worker verify: %s", err);

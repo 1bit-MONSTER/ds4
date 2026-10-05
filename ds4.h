@@ -580,11 +580,16 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
                                  char *err, size_t errlen);
 /* TP worker side of a mirrored speculative-verify block: run its half of the
  * batch verify for KV side effects, then obey the leader's commit frame
- * (keep, or roll back and replay). Only called from ds4_tp_worker_run. */
+ * (keep, or roll back and replay). flags are the VERIFY frame's
+ * DS4_TP_VERIFY_* bits. Only called from ds4_tp_worker_run. */
 int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
-                              char *err, size_t errlen);
+                              uint32_t flags, char *err, size_t errlen);
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen);
+/* TP worker side of a lockstep DSpark DRAFT/MAINTAIN frame (mode is a
+ * DS4_TP_DSPARK_* value).  Only called from ds4_tp_worker_run. */
+int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
+                                uint32_t mode, char *err, size_t errlen);
 void ds4_session_invalidate(ds4_session *s);
 /* Keep the token prefix, restoring recurrent state where possible. Otherwise
  * the checkpoint becomes invalid: sync the retained prefix before eval.

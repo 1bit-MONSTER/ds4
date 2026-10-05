@@ -148,9 +148,10 @@ static void run_case(uint32_t rank, uint32_t vocab) {
 }
 
 int main(void) {
-    run_case(32, 257);
-    run_case(256, 257);
-    run_case(32, 32771);
-    run_case(256, 32771);
+    for (uint32_t rank = 32; rank <= 256; rank += 32) {
+        run_case(rank, 257);
+        run_case(rank, 32771);
+    }
+    run_case(256, 129283);
     return 0;
 }
