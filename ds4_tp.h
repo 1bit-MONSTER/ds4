@@ -30,8 +30,9 @@ enum {
     DS4_TP_GATE_ATTN = 0,
     DS4_TP_GATE_FFN = 1,
     DS4_TP_GATES_PER_LAYER = 2,
-    /* Max rows in a verify-block batch gate (speculative blocks are <=5). */
+    /* Includes the seed row as well as drafted tokens. */
     DS4_TP_BATCH_MAX_ROWS = 8,
+    DS4_TP_BATCH_GATES_PER_LAYER = 2,
 };
 
 /* Engine identity exchanged in the hello so a mismatched pair aborts before
@@ -115,7 +116,8 @@ void ds4_tp_mark_failed(ds4_tp *tp);
  *   in  vectors   S * vec_bytes   RDMA/TCP-written with the peer partials
  *   in  seq flags S * 8           written strictly after each in vector
  *   token slot    16              {seq u64, token i32, pad} leader->worker
- *   (gpu flags, then batch out/in: n_layer * BATCH_MAX_ROWS * vec_bytes
+ *   (gpu flags, then batch out/in:
+ *    n_layer * BATCH_GATES_PER_LAYER * BATCH_MAX_ROWS * vec_bytes
  *    each, row partials for the speculative verify-block gates)
  *
  * vec_bytes = n_embd * 4 (f32 partials, never quantized on the wire). */
@@ -143,6 +145,11 @@ int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
 /* Verify-block RDMA window (speculative decoding): call on both ranks right
  * before/after a verify block with one batch gate per layer. */
 int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers);
+/* Negotiate one or two batch gates per layer before encoding the block.
+ * Both ranks receive the smaller offered count. Slots are then consecutive
+ * gate indices, not layer indices. Works with RDMA and TCP. */
+int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                  uint32_t *gates_per_layer);
 int ds4_tp_batch_block_end(ds4_tp *tp);
 
 /* Prefill batch gate: arbitrary-size symmetric payload exchange over bulk

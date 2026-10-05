@@ -7,6 +7,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int check_prefix(ds4_engine *engine, int prefix) {
     ds4_session *spec = NULL, *ref = NULL;
@@ -70,9 +71,15 @@ done:
 }
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: %s MODEL SUPPORT LISTEN_HOST PORT RDMA_DEVICE\n", argv[0]);
+    bool cuda = false, tcp = false;
+    if (argc < 6 || argc > 9) {
+        fprintf(stderr, "usage: %s MODEL SUPPORT LISTEN_HOST PORT RDMA_DEVICE [GID [--cuda] [--tcp]]\n", argv[0]);
         return 2;
+    }
+    for (int i = 7; i < argc; i++) {
+        if (!strcmp(argv[i], "--cuda") && !cuda) cuda = true;
+        else if (!strcmp(argv[i], "--tcp") && !tcp) tcp = true;
+        else return 2;
     }
     char *end = NULL;
     const long port = strtol(argv[4], &end, 10);
@@ -80,12 +87,20 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid port: %s\n", argv[4]);
         return 2;
     }
+    long gid = 1;
+    if (argc >= 7) {
+        gid = strtol(argv[6], &end, 10);
+        if (end == argv[6] || *end || gid < 0 || gid > 255) return 2;
+    }
     ds4_engine_options opt = {
         .model_path = argv[1], .mtp_path = argv[2], .dspark = true,
-        .backend = DS4_BACKEND_METAL, .n_threads = 1, .context_size = 8192,
+        .backend = cuda ? DS4_BACKEND_CUDA : DS4_BACKEND_METAL,
+        .n_threads = 1, .context_size = 8192,
+        .prefill_chunk = cuda ? 2048 : 0,
         .tp = {.role = DS4_TP_LEADER, .listen_host = argv[3],
-               .listen_port = (int)port, .transport = DS4_TP_TRANSPORT_RDMA,
-               .rdma_device = argv[5], .rdma_gid_index = 1, .rdma_gid_index_set = true},
+               .listen_port = (int)port,
+               .transport = tcp ? DS4_TP_TRANSPORT_TCP : DS4_TP_TRANSPORT_RDMA,
+               .rdma_device = argv[5], .rdma_gid_index = (int)gid, .rdma_gid_index_set = true},
     };
     ds4_engine *engine = NULL;
     ds4_tp *tp = NULL;

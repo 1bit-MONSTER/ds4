@@ -201,6 +201,17 @@ static void check_rdma(uint32_t max_msg) {
     assert(ds4_tp_batch_block_end(&tp));
     assert(f.ns == 8u * chunks && f.ds == 8u * chunks && !f.unsignaled);
 
+    for (unsigned rows = 2; rows <= 8; rows += 2) {
+        f = (fake_rdma){.expected = out, .expected_bytes = bytes, .poll_batch = 1};
+        uint32_t gates = 2;
+        assert(ds4_tp_batch_block_begin_gates(&tp, rows, 3, &gates));
+        assert(gates == 2);
+        for (unsigned slot = 0; slot < 6; slot++)
+            assert(ds4_tp_batch_gate_exchange(&tp, slot, rows, slot + 1));
+        assert(ds4_tp_batch_block_end(&tp));
+        assert(f.ns == 6u * rows * chunks && f.ds == f.ns && !f.unsignaled);
+    }
+
     shutdown(fd[0], SHUT_RDWR);
     assert(pthread_join(echo, NULL) == 0);
     close(fd[0]); close(fd[1]);

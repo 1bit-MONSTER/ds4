@@ -19,49 +19,63 @@ static ds4_gpu_tensor *upload(const float *data, size_t count) {
     return t;
 }
 
-static void run(float *model, uint32_t tokens, uint32_t pos, uint32_t ratio) {
-    enum { H = 64, D = 512, W = 128 };
+static void run(float *model, uint32_t tokens, uint32_t pos, uint32_t ratio,
+                uint32_t H, uint32_t raw_start, float query_scale) {
+    enum { D = 512, W = 128 };
     const uint32_t past = pos < W - 1 ? pos : W - 1;
     const uint32_t raw_count = past + tokens;
     const uint32_t comp_count = ratio ? (pos + tokens) / ratio : 0;
     const size_t nq = (size_t)tokens * H * D;
     float *q = malloc(nq * sizeof(float));
-    float *actual = malloc(nq * sizeof(float));
+    float *actual = malloc((nq + 8) * sizeof(float));
     float *raw = malloc((size_t)raw_count * D * sizeof(float));
     float *comp = malloc((size_t)(comp_count + 1) * D * sizeof(float));
     check(q && actual && raw && comp, "host allocation");
     /* Exactly representable inputs. Nonzero queries exercise the score MMA,
      * varying rows exercise the value MMA, and sinks exercise normalization. */
-    for (size_t i = 0; i < nq; i++) q[i] = ((int)(i % 17) - 8) * 0.03125f;
+    for (size_t i = 0; i < nq; i++) q[i] = ((int)(i % 17) - 8) * query_scale;
     for (size_t i = 0; i < (size_t)raw_count * D; i++)
         raw[i] = ((int)((i * 7 + i / D) % 29) - 14) * 0.03125f;
     for (size_t i = 0; i < (size_t)(comp_count + 1) * D; i++)
         comp[i] = ((int)((i * 11 + i / D) % 31) - 15) * 0.03125f;
-    ds4_gpu_tensor *qg = upload(q, nq), *rg = upload(raw, (size_t)raw_count * D);
+    float *ring = malloc((size_t)raw_count * D * sizeof(float));
+    check(ring != NULL, "ring allocation");
+    for (uint32_t r = 0; r < raw_count; r++) for (uint32_t d = 0; d < D; d++)
+        ring[(size_t)((raw_start + r) % raw_count) * D + d] = raw[(size_t)r * D + d];
+    ds4_gpu_tensor *qg = upload(q, nq), *rg = upload(ring, (size_t)raw_count * D);
     ds4_gpu_tensor *cg = upload(comp, (size_t)(comp_count + 1) * D);
-    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc(nq * sizeof(float));
-    check(out != NULL, "output allocation");
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((nq + 8) * sizeof(float));
+    check(out && ds4_gpu_tensor_fill_f32(out, NAN, nq + 8), "output allocation");
     if (ratio)
         check(ds4_gpu_attention_decode_mixed_batch_heads_tensor(out, model, 65536, 0,
-              qg, rg, cg, 0, NULL, 0, tokens, pos, raw_count, raw_count, 0,
+              qg, rg, cg, 0, NULL, 0, tokens, pos, raw_count, raw_count, raw_start,
               comp_count, W, ratio, H, D), "dense mixed attention");
     else
         check(ds4_gpu_attention_decode_raw_batch_heads_tensor(out, model, 65536, 0,
-              qg, rg, tokens, pos, raw_count, raw_count, 0, W, H, D), "raw attention");
-    check(ds4_gpu_tensor_read(out, 0, actual, nq * sizeof(float)), "attention read");
+              qg, rg, tokens, pos, raw_count, raw_count, raw_start, W, H, D), "raw attention");
+    check(ds4_gpu_tensor_read(out, 0, actual, (nq + 8) * sizeof(float)), "attention read");
+    for (size_t i = nq; i < nq + 8; i++) check(isnan(actual[i]), "output tail");
     double max_error = 0;
     for (uint32_t t = 0; t < tokens; t++) {
         const uint32_t begin = past + t + 1 > W ? past + t + 1 - W : 0;
         const uint32_t visible = ratio ? (pos + t + 1) / ratio : 0;
         for (uint32_t h = 0; h < H; h += 7) {
             const size_t base = ((size_t)t * H + h) * D;
-            double sum = exp(model[h]), value[D] = {0};
+            double maximum = model[h];
             for (uint32_t r = begin; r < past + t + 1 + visible; r++) {
                 const float *kv = r < past + t + 1 ? raw + (size_t)r * D :
                                   comp + (size_t)(r - past - t - 1) * D;
                 double dot = 0;
                 for (uint32_t d = 0; d < D; d++) dot += (double)q[base + d] * kv[d];
-                const double p = exp(dot / sqrt(D));
+                maximum = fmax(maximum, dot / sqrt(D));
+            }
+            double sum = exp(model[h] - maximum), value[D] = {0};
+            for (uint32_t r = begin; r < past + t + 1 + visible; r++) {
+                const float *kv = r < past + t + 1 ? raw + (size_t)r * D :
+                                  comp + (size_t)(r - past - t - 1) * D;
+                double dot = 0;
+                for (uint32_t d = 0; d < D; d++) dot += (double)q[base + d] * kv[d];
+                const double p = exp(dot / sqrt(D) - maximum);
                 sum += p;
                 for (uint32_t d = 0; d < D; d++) value[d] += p * kv[d];
             }
@@ -72,11 +86,11 @@ static void run(float *model, uint32_t tokens, uint32_t pos, uint32_t ratio) {
             }
         }
     }
-    printf("token-tile tokens=%u pos=%u ratio=%u max_error=%.8g: PASS\n",
-           tokens, pos, ratio, max_error);
+    printf("attention tokens=%u pos=%u ratio=%u heads=%u ring=%u max_error=%.8g: PASS\n",
+           tokens, pos, ratio, H, raw_start, max_error);
     ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(cg);
     ds4_gpu_tensor_free(rg); ds4_gpu_tensor_free(qg);
-    free(comp); free(raw); free(actual); free(q);
+    free(ring); free(comp); free(raw); free(actual); free(q);
 }
 
 int main(void) {
@@ -88,11 +102,18 @@ int main(void) {
     check(model != MAP_FAILED, "model allocation");
     for (int i = 0; i < 64; i++) model[i] = (i % 7 - 3) * 0.125f;
     check(ds4_gpu_init() && ds4_gpu_set_model_map(model, 65536), "GPU initialization");
-    run(model, 128, 0, 0);
-    run(model, 131, 513, 0);
-    run(model, 129, 0, 2);
-    run(model, 257, 1025, 2);
-    run(model, 131, 129, 1);
+    run(model, 128, 0, 0, 64, 0, 0.03125f);
+    run(model, 131, 513, 0, 64, 0, 0.03125f);
+    run(model, 129, 0, 2, 64, 0, 0.03125f);
+    run(model, 257, 1025, 2, 64, 0, 0.03125f);
+    run(model, 131, 129, 1, 64, 0, 0.03125f);
+    for (uint32_t rows = 2; rows <= 7; rows++) {
+        run(model, rows, 0, 0, 61, 0, 0.03125f);
+        run(model, rows, 127, 0, 64, 37, 3.0f);
+        run(model, rows, 127, 4, 64, 37, 0.03125f);
+        run(model, rows, 2047, 4, 61, 37, 3.0f);
+        run(model, rows, 32767, 128, 64, 37, 0.03125f);
+    }
     ds4_gpu_cleanup();
     munmap(model, 65536);
     return 0;

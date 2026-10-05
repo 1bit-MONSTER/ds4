@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     const uint64_t slab_bytes = ds4_tp_slab_bytes(id.n_layer, id.n_embd);
     ds4_gpu_tensor *input = NULL, *result = NULL;
     ds4_gpu_tensor *out[80] = {0}, *in[80] = {0};
-    ds4_gpu_tensor *bout[40] = {0}, *bin[40] = {0};
+    ds4_gpu_tensor *bout[80] = {0}, *bin[80] = {0};
     float *host = NULL;
     char error[256] = "";
     int rc = 1;
@@ -91,7 +91,7 @@ int main(int argc, char **argv) {
         in[i] = ds4_gpu_tensor_view(h.slab, ds4_tp_slab_in_offset(h.tp, i / 2, i % 2), h.vec);
         CHECK(out[i] && in[i]);
     }
-    for (uint32_t i = 0; i < 40; i++) {
+    for (uint32_t i = 0; i < 80; i++) {
         bout[i] = ds4_gpu_tensor_view(h.slab, ds4_tp_slab_batch_out_offset(h.tp, i), 8 * h.vec);
         bin[i] = ds4_gpu_tensor_view(h.slab, ds4_tp_slab_batch_in_offset(h.tp, i), 8 * h.vec);
         CHECK(bout[i] && bin[i]);
@@ -101,11 +101,18 @@ int main(int argc, char **argv) {
     ds4_gpu_tp_set_batch_exchange(batch_exchange);
     const uint32_t batches[] = {1, 2, 8, 3, 1};
     for (unsigned phase = 0; phase < sizeof(batches) / sizeof(*batches); phase++) {
-        const uint32_t rows = batches[phase], slots = rows == 1 ? 80 : 40;
+        const uint32_t rows = batches[phase];
         const uint64_t bytes = rows * h.vec;
         double start = now();
+        unsigned total_gates = 0;
         for (uint32_t epoch = 0; epoch < 40; epoch++) {
-            if (rows > 1) CHECK(ds4_tp_batch_block_begin(h.tp, rows, 40));
+            uint32_t gates = epoch % 3 == 0 ? 2 : epoch % 3 == 1 ? 1u + rank : 1;
+            if (rows > 1) {
+                CHECK(ds4_tp_batch_block_begin_gates(h.tp, rows, 40, &gates));
+                CHECK(gates == (epoch % 3 == 0 ? 2u : 1u));
+            }
+            const uint32_t slots = rows == 1 ? 80 : 40 * gates;
+            total_gates += slots;
             for (uint32_t i = 0; i < slots; i++) {
                 const float value = phase * 10000u + epoch * 100u + i;
                 ds4_gpu_tensor *a = rows == 1 ? out[i] : bout[i];
@@ -132,14 +139,14 @@ int main(int argc, char **argv) {
             }
         }
         fprintf(stderr, "rank=%d shared=%d rows=%u GPU exchange/check %.2f us/gate: PASS\n",
-            rank, shared, rows, (now() - start) * 1e6 / (40 * slots));
+            rank, shared, rows, (now() - start) * 1e6 / total_gates);
     }
     rc = 0;
 done:
     ds4_gpu_tp_shutdown();
     if (h.tp) ds4_tp_detach_slab(h.tp);
     for (unsigned i = 0; i < 80; i++) { ds4_gpu_tensor_free(out[i]); ds4_gpu_tensor_free(in[i]); }
-    for (unsigned i = 0; i < 40; i++) { ds4_gpu_tensor_free(bout[i]); ds4_gpu_tensor_free(bin[i]); }
+    for (unsigned i = 0; i < 80; i++) { ds4_gpu_tensor_free(bout[i]); ds4_gpu_tensor_free(bin[i]); }
     ds4_gpu_tensor_free(result); ds4_gpu_tensor_free(input); ds4_gpu_tensor_free(h.slab);
     ds4_tp_free(h.tp); free(h.staging); free(host);
     ds4_gpu_cleanup();

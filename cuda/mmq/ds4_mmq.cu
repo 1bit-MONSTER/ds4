@@ -502,7 +502,7 @@ ggml_backend_cuda_context * get_ctx_for_device(int device) {
 
 template <ggml_type type>
 bool ds4_mmq_k_tile_supported(const char *tag, int K, int cc) {
-    if constexpr (type == GGML_TYPE_MXFP4 || type == GGML_TYPE_NVFP4) {
+    if constexpr (type == GGML_TYPE_NVFP4) {
         if (blackwell_mma_available(cc) && K % MMQ_ITER_K_FP4 != 0) {
             fprintf(stderr,
                     "%s: Blackwell FP4 K=%d must be a multiple of %d\n",
@@ -559,7 +559,7 @@ int ds4_mmq_dense_impl(
     ds4_pool_set_stream(stream);
 
     // 1. Quantize F32 activations into the format consumed by MMQ. Blackwell
-    //    MXFP4 uses native FP4 tensor cores; other paths use MMQ Q8_1.
+    //    MXFP4 retains Q8 activations, including on native FP4 hardware.
     const int64_t ne00         = K;
     const int64_t ne10_padded  = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t ne11         = N;
@@ -567,7 +567,7 @@ int ds4_mmq_dense_impl(
     const int64_t ne13         = 1;
 
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4
@@ -1029,10 +1029,9 @@ int ds4_mmq_moe_impl(
         return -2;
     }
 
-    // 2. Gather + quantize activations. Native Blackwell MXFP4 consumes FP4;
-    //    all other MMQ kernels consume Q8_1.
+    // 2. Gather + quantize activations, retaining Q8 precision for MXFP4.
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4
@@ -1347,7 +1346,7 @@ int ds4_mmq_moe_pair_impl(
     size_t direct_work_bytes = 0;
 
     const bool use_native_fp4 =
-        type == GGML_TYPE_MXFP4 && blackwell_mma_available(cc);
+        type == GGML_TYPE_NVFP4 && blackwell_mma_available(cc);
     const size_t y_block_size = use_native_fp4
         ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4

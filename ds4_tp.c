@@ -39,8 +39,8 @@
 
 #define DS4_TP_MAGIC UINT32_C(0x44533454) /* "DS4T" */
 #define DS4_TP_BATCH_MAGIC UINT32_C(0x44533442) /* "DS4B" */
-/* V4.1 CUDA workers now return half-logit frames after successful work. */
-#define DS4_TP_PROTOCOL_VERSION 14u
+/* Two-slot verification slabs and per-block graph negotiation. */
+#define DS4_TP_PROTOCOL_VERSION 15u
 
 #define DS4_TP_DEFAULT_TIMEOUT_SEC 300
 /* Once both ranks enter a Metal gate, a live exchange normally completes in
@@ -664,7 +664,8 @@ uint64_t ds4_tp_slab_bytes(uint32_t n_layer, uint32_t n_embd) {
            slots * 8 * 2 +      /* in flags + out flag staging */
            16 +                 /* token slot */
            slots * 4 +          /* GPU-written gate-ready flags */
-           (uint64_t)n_layer * DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
+           (uint64_t)n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
+           DS4_TP_BATCH_MAX_ROWS * vec * 2; /* batch out+in */
 }
 
 static void tp_slab_layout(ds4_tp *tp) {
@@ -678,9 +679,11 @@ static void tp_slab_layout(ds4_tp *tp) {
     tp->gpu_flags_off = tp->out_flags_off + slots * 8;
     tp->batch_out_off = tp->gpu_flags_off + slots * 4;
     tp->batch_in_off = tp->batch_out_off +
-                       (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                       (uint64_t)tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
+                       DS4_TP_BATCH_MAX_ROWS * vec;
     tp->slab_bytes = tp->batch_in_off +
-                     (uint64_t)tp->n_layer * DS4_TP_BATCH_MAX_ROWS * vec;
+                     (uint64_t)tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER *
+                     DS4_TP_BATCH_MAX_ROWS * vec;
 }
 
 uint64_t ds4_tp_slab_gpu_flags_offset(const ds4_tp *tp) {
@@ -2203,40 +2206,66 @@ int ds4_tp_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t gate, uint64_t seq
     return 1;
 }
 
-/* Verify-block batch gate: one exchange per layer moving all block rows at
+/* Verify-block batch gate: one exchange moving all block rows at
  * once. The payload lives in the registered slab, so RDMA sends it directly;
  * TCP exchanges both directions concurrently. */
-/* Verify-block window: called on both ranks right before a speculative
- * verify block whose every layer ends in one batch gate of `rows` rows.
+/* Verify-block window: called on both ranks before a speculative block.
  * Drains the decode receive window, posts the first layer's receives,
- * crosses one control-byte barrier (so both sides are posted before any
- * send), and from then on each gate posts the next layer's receives and
- * sends its rows without any handshake.  Returns 1 also when RDMA is not
- * in use (the TCP fallback keeps its per-gate headers). */
+ * agrees the gate count (so both sides are posted before any send), and
+ * then each gate posts the next gate's receives without another handshake.
+ * TCP uses the same shape agreement, followed by per-gate headers. */
 int ds4_tp_batch_block_begin(ds4_tp *tp, uint32_t rows, uint32_t n_layers) {
+    uint32_t gates = 1;
+    return ds4_tp_batch_block_begin_gates(tp, rows, n_layers, &gates);
+}
+
+int ds4_tp_batch_block_begin_gates(ds4_tp *tp, uint32_t rows, uint32_t n_layers,
+                                  uint32_t *gates_per_layer) {
+    if (!tp || ds4_tp_failed(tp) || !gates_per_layer || *gates_per_layer < 1 ||
+        *gates_per_layer > DS4_TP_BATCH_GATES_PER_LAYER ||
+        rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 ||
+        n_layers > tp->n_layer || n_layers > UINT16_MAX / DS4_TP_BATCH_GATES_PER_LAYER)
+        return 0;
 #ifdef DS4_TP_HAVE_VERBS
-    if (!tp->rdma_active || !tp_rdma_big_gate_capable(tp)) return 1;
-    if (getenv("DS4_TP_DISABLE_VERIFY_WINDOW")) return 1;
     ds4_tp_rdma *r = &tp->rdma;
-    if (rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS || n_layers == 0 || r->block_active) return 0;
-    if (!tp_rdma_drain_decode_window(tp)) return 0;
-    pthread_mutex_lock(&r->post_lock);
-    r->block_active = true;
-    r->block_rows = rows;
-    r->block_layers = n_layers;
-    r->block_posted = 0;
-    r->block_recv_done = 0;
-    const int ok = tp_rdma_block_post_layer(tp, 0);
-    pthread_mutex_unlock(&r->post_lock);
-    if (!ok) { r->block_active = false; return 0; }
-    if (!tp_rdma_window_barrier(tp, 0xB5u)) { r->block_active = false; return 0; }
-    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
-        fprintf(stderr, "ds4-tp: verify window armed: %u rows x %u layers\n", rows, n_layers);
-    return 1;
-#else
-    (void)tp; (void)rows; (void)n_layers;
-    return 1;
+    if (r->block_active) return 0;
+    if (tp->rdma_active && !tp_rdma_drain_decode_window(tp)) return 0;
+    const bool window = tp->rdma_active && tp_rdma_big_gate_capable(tp) &&
+                        !getenv("DS4_TP_DISABLE_VERIFY_WINDOW");
+    if (window) {
+        pthread_mutex_lock(&r->post_lock);
+        r->block_active = true;
+        r->block_rows = rows;
+        r->block_layers = n_layers * *gates_per_layer;
+        r->block_posted = 0;
+        r->block_recv_done = 0;
+        const int ok = tp_rdma_block_post_layer(tp, 0);
+        pthread_mutex_unlock(&r->post_lock);
+        if (!ok) { r->block_active = false; return 0; }
+    }
 #endif
+    /* Posting slot zero does not depend on the selected gate count. This
+     * exchange both agrees the graph and proves the peer's receive is ready. */
+    const uint32_t mine[4] = {DS4_TP_BATCH_MAGIC, rows, n_layers, *gates_per_layer};
+    uint32_t peer[4];
+    if (!tp_tcp_exchange(tp, NULL, NULL, mine, peer, sizeof(mine)) ||
+        peer[0] != mine[0] || peer[1] != rows || peer[2] != n_layers ||
+        peer[3] < 1 || peer[3] > DS4_TP_BATCH_GATES_PER_LAYER) {
+#ifdef DS4_TP_HAVE_VERBS
+        r->block_active = false;
+#endif
+        ds4_tp_mark_failed(tp);
+        fprintf(stderr, "ds4-tp: verify-block shape negotiation failed\n");
+        return 0;
+    }
+    if (peer[3] < *gates_per_layer) *gates_per_layer = peer[3];
+    if (getenv("DS4_TP_BIG_GATE_DEBUG"))
+        fprintf(stderr, "ds4-tp: verify block agreed: %u rows x %u layers x %u gates\n",
+                rows, n_layers, *gates_per_layer);
+#ifdef DS4_TP_HAVE_VERBS
+    if (window) r->block_layers = n_layers * *gates_per_layer;
+#endif
+    return 1;
 }
 
 /* End of the verify block: every gate must have been exchanged (all
@@ -2270,7 +2299,8 @@ int ds4_tp_batch_block_end(ds4_tp *tp) {
 
 int ds4_tp_batch_gate_exchange(ds4_tp *tp, uint32_t layer, uint32_t rows,
                                uint64_t seq) {
-    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS) return 0;
+    if (tp->data_fd < 0 || rows == 0 || rows > DS4_TP_BATCH_MAX_ROWS ||
+        layer >= tp->n_layer * DS4_TP_BATCH_GATES_PER_LAYER) return 0;
     const uint64_t bytes = (uint64_t)rows * tp->vec_bytes;
     ds4_tp_gate_header h = { DS4_TP_BATCH_MAGIC, (uint16_t)layer,
                              (uint16_t)rows, seq };
