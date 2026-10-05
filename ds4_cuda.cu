@@ -105,6 +105,7 @@ static int g_model_direct_fd = -1;
 static uint64_t g_model_direct_align = 1;
 static uint64_t g_model_file_size;
 static int g_model_cache_full;
+static bool g_network_tp_async_copy;
 static cudaStream_t g_model_prefetch_stream;
 static cudaStream_t g_model_upload_stream;
 static int g_cublas_ready;
@@ -3039,7 +3040,8 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     int d = ds4_tensor_device_idx(t);
     if (t->owner && t->ptr) {
         WITH_DEVICE(g_gpu[d].device_id) {
-            (void)cudaFree(t->ptr);
+            if (t->owner == 2) (void)cudaFreeHost(t->ptr);
+            else (void)cudaFree(t->ptr);
         }
     }
     t->ptr = NULL;
@@ -3192,7 +3194,8 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     int d = ds4_tensor_device_idx(tensor);
     if (tensor->owner && tensor->ptr) {
         WITH_DEVICE(g_gpu[d].device_id) {
-            (void)cudaFree(tensor->ptr);
+            if (tensor->owner == 2) (void)cudaFreeHost(tensor->ptr);
+            else (void)cudaFree(tensor->ptr);
         }
     }
     free(tensor);
@@ -3259,7 +3262,9 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     int d = ds4_tensor_device_idx(dst);
     int ok = 0;
     WITH_DEVICE(g_gpu[d].device_id) {
-        if (g_decode_graph_capturing) {
+        /* TP gates drain the stream before exposing results to the peer. Keep
+         * intermediate device copies queued instead of stalling submission. */
+        if (g_decode_graph_capturing || g_network_tp_async_copy) {
             ok = cuda_ok(cudaMemcpyAsync((char *)dst->ptr + dst_offset,
                                          (const char *)src->ptr + src_offset,
                                          (size_t)bytes,
@@ -10623,7 +10628,7 @@ __device__ __forceinline__ uint32_t tt_ring_off_bytes(uint32_t row, uint32_t c) 
 
 __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
                  : "r"(a));
 #else
@@ -10634,7 +10639,7 @@ __device__ __forceinline__ void tt_ldmatrix_x4_addr(uint32_t (&r)[4], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else
@@ -10645,7 +10650,7 @@ __device__ __forceinline__ void tt_ldmatrix_x2_addr(uint32_t (&r)[2], unsigned a
 
 __device__ __forceinline__ void tt_ldmatrix_x2_trans_addr(uint32_t (&r)[2], unsigned a) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.b16 {%0, %1}, [%2];"
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
                  : "=r"(r[0]), "=r"(r[1])
                  : "r"(a));
 #else
@@ -13792,13 +13797,15 @@ __global__ static void indexer_topk_1024_kernel(
     if (tid < top_k) selected[(uint64_t)t * top_k + tid] = idxs[tid];
 }
 
-template <uint32_t SORT_N>
+template <uint32_t SORT_N, bool CAUSAL = false>
 __global__ static void indexer_topk_pow2_kernel(
         uint32_t *selected,
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        uint32_t start = 0,
+        uint32_t ratio = 1) {
     uint32_t t = blockIdx.x;
     uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
@@ -13806,8 +13813,9 @@ __global__ static void indexer_topk_pow2_kernel(
     __shared__ uint32_t idxs[SORT_N];
 
     const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t visible = CAUSAL ? (start + t + 1u) / ratio : n_comp;
     for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
+        if (i < visible) {
             vals[i] = row[i];
             idxs[i] = i;
         } else {
@@ -14099,12 +14107,15 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
  * 512th-best key seen so far, so it can only discard candidates that cannot
  * belong to the final top set. Packing supplies the same value/index total
  * order as the existing bitonic and CUB tiers. */
+template<bool CAUSAL>
 __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
         uint32_t *selected,
         const float *scores,
         uint32_t n_comp,
         uint32_t n_tokens,
-        uint32_t top_k) {
+        uint32_t top_k,
+        uint32_t start_pos = 0,
+        uint32_t ratio = 1) {
     constexpr uint32_t STREAM_THREADS = 512u;
     constexpr uint32_t STREAM_ITEMS = 4u;
     constexpr uint32_t STREAM_CAP = STREAM_THREADS * STREAM_ITEMS;
@@ -14118,6 +14129,7 @@ __global__ static void __launch_bounds__(512) indexer_topk_stream512_kernel(
     const uint32_t tid = threadIdx.x;
     if (t >= n_tokens) return;
     const float *row = scores + (uint64_t)t * n_comp;
+    if (CAUSAL) n_comp = min(n_comp, (start_pos + t + 1u) / ratio);
     if (tid == 0u) {
         s_cnt = 0u;
         s_thr = 0u;
@@ -14642,7 +14654,7 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     if (top_k == 512u && n_tokens >= 32u &&
         getenv("DS4_CUDA_NO_TOPK2048") == NULL &&
         getenv("DS4_CUDA_NO_TOPK_STREAM") == NULL) {
-        indexer_topk_stream512_kernel<<<n_tokens, 512>>>(
+        indexer_topk_stream512_kernel<false><<<n_tokens, 512>>>(
                 (uint32_t *)selected->ptr,
                 (const float *)scores->ptr,
                 n_comp, n_tokens, top_k);
@@ -33613,6 +33625,28 @@ extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *te
                    "selected tensor read");
 }
 
+extern "C" ds4_gpu_tensor *ds4_gpu_tp_slab_alloc(uint64_t bytes) {
+    if (!ds4_gpu_device_is_spark() || !bytes || bytes > SIZE_MAX ||
+        getenv("DS4_CUDA_DISABLE_TP_HOST_SLAB")) return NULL;
+    ds4_gpu_tensor *t = (ds4_gpu_tensor *)calloc(1, sizeof(*t));
+    if (!t) return NULL;
+    void *host = NULL, *device = NULL;
+    cudaError_t err = cudaHostAlloc(&host, (size_t)bytes, cudaHostAllocMapped);
+    if (err == cudaSuccess) err = cudaHostGetDevicePointer(&device, host, 0);
+    /* A single address is required by both CUDA tensor views and ibverbs. */
+    if (err != cudaSuccess || host != device) {
+        if (host) (void)cudaFreeHost(host);
+        (void)cudaGetLastError();
+        free(t);
+        return NULL;
+    }
+    t->ptr = host;
+    t->bytes = bytes;
+    t->owner = 2; /* Pinned host allocation, released with cudaFreeHost. */
+    t->device_id = 0;
+    return t;
+}
+
 static struct {
     ds4_gpu_tp_exchange_fn row;
     ds4_gpu_tp_batch_exchange_fn batch;
@@ -33624,6 +33658,7 @@ static struct {
 
 extern "C" void ds4_gpu_tp_shutdown(void) {
     if (g_cuda_tp.row) (void)cudaDeviceSynchronize();
+    g_network_tp_async_copy = false;
     if (g_cuda_tp.staging) (void)cudaFreeHost(g_cuda_tp.staging);
     g_cuda_tp = {};
 }
@@ -33637,6 +33672,7 @@ extern "C" int ds4_gpu_tp_init(uint32_t rank, ds4_gpu_tensor *slab,
     g_cuda_tp.row = fn;
     g_cuda_tp.ud = ud;
     g_cuda_tp.vec_bytes = vec_bytes;
+    g_network_tp_async_copy = !getenv("DS4_CUDA_DISABLE_TP_ASYNC_COPY");
     return 1;
 }
 

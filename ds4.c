@@ -72497,7 +72497,12 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);
     e->tp.ctx = tp;
-    e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
+    bool shared_cuda_slab = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    e->tp.slab = ds4_gpu_tp_slab_alloc(slab_bytes);
+    shared_cuda_slab = e->tp.slab != NULL;
+#endif
+    if (!e->tp.slab) e->tp.slab = ds4_gpu_tensor_alloc(slab_bytes);
     e->tp.zero_vec = ds4_gpu_tensor_alloc(vec_bytes);
     e->tp.out_views = calloc(slots, sizeof(*e->tp.out_views));
     e->tp.in_views = calloc(slots, sizeof(*e->tp.in_views));
@@ -72513,7 +72518,7 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         goto fail;
     }
     void *network_slab;
-    if (e->backend == DS4_BACKEND_CUDA) {
+    if (e->backend == DS4_BACKEND_CUDA && !shared_cuda_slab) {
         e->tp.host_slab = calloc(1, (size_t)slab_bytes);
         network_slab = e->tp.host_slab;
     } else {

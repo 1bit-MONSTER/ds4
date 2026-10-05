@@ -124,7 +124,8 @@ static void *echo_barriers(void *arg) {
     return NULL;
 }
 
-static void check_rdma(void) {
+static void check_rdma(uint32_t max_msg) {
+    atomic_store(&decode_barriers, 0u);
     const uint64_t bytes = 3u * 4u * 1024u * 1024u + 4u;
     uint8_t *out = malloc(bytes), *in = malloc(bytes);
     assert(out && in);
@@ -137,6 +138,8 @@ static void check_rdma(void) {
     struct ibv_mr mr = {.lkey = 1};
     ds4_tp tp = {.n_layer = 40, .n_slots = 80, .vec_bytes = 5120 * 4,
         .gate_timeout_ms = 1000};
+    tp.rdma.max_msg = max_msg;
+    const uint32_t chunks = (tp.vec_bytes + tp_rdma_max_msg(&tp) - 1u) / tp_rdma_max_msg(&tp);
     tp_slab_layout(&tp);
     tp.slab = calloc(1, tp.slab_bytes);
     assert(tp.slab);
@@ -168,7 +171,7 @@ static void check_rdma(void) {
         assert(!tp_rdma_big_gate_exchange(&tp, out, in, bytes));
     }
 
-    /* Decode has two messages per gate at hidden width 5120. */
+    /* 5120-wide rows use two legacy messages or one negotiated RC message. */
     f = (fake_rdma){.expected = out, .expected_bytes = bytes, .poll_batch = 1,
         .required_decode_barriers = 1};
     tp.gates_per_token = 80; tp.gate_slot_step = 1;
@@ -176,7 +179,7 @@ static void check_rdma(void) {
     assert(atomic_load(&decode_barriers) == 1u);
     assert(tp.rdma.send_outstanding == f.ns - f.ds);
     while (tp.rdma.send_outstanding) assert(tp_rdma_drain_cq(&tp));
-    assert(f.ns == 2 && f.ds == 2 && !f.unsignaled);
+    assert(f.ns == chunks && f.ds == chunks && !f.unsignaled);
 
     /* Drain the posted decode receives before using the slab for bulk. */
     f = (fake_rdma){.expected = out, .expected_bytes = bytes, .poll_batch = 1};
@@ -196,7 +199,7 @@ static void check_rdma(void) {
     assert(tp_rdma_block_gate_exchange(&tp, 0, 8));
     assert(tp.rdma.send_outstanding == f.ns - f.ds);
     assert(ds4_tp_batch_block_end(&tp));
-    assert(f.ns == 16 && f.ds == 16 && !f.unsignaled);
+    assert(f.ns == 8u * chunks && f.ds == 8u * chunks && !f.unsignaled);
 
     shutdown(fd[0], SHUT_RDWR);
     assert(pthread_join(echo, NULL) == 0);
@@ -213,7 +216,17 @@ int main(void) {
 #ifdef __linux__
     check_gid();
 #endif
-    check_rdma();
+    assert(tp_rdma_negotiate_max_msg(0, 0) == 16384u);
+    assert(tp_rdma_negotiate_max_msg(65536, 0) == 16384u);
+    assert(tp_rdma_negotiate_max_msg(0, 65536) == 16384u);
+    assert(tp_rdma_negotiate_max_msg(65536, 16384) == 16384u);
+    assert(tp_rdma_negotiate_max_msg(65536, 32768) == 32768u);
+    assert(tp_rdma_negotiate_max_msg(65536, 65536) == 65536u);
+    assert(!tp_rdma_negotiate_max_msg(65536, 8192));
+    assert(!tp_rdma_negotiate_max_msg(65536, 24576));
+    check_rdma(0);
+    check_rdma(32768);
+    check_rdma(65536);
 #else
     puts("SKIP: RDMA completion tests require verbs headers");
 #endif

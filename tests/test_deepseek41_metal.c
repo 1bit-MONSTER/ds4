@@ -1022,7 +1022,7 @@ static int check_general_topk(void) {
 }
 
 static int check_causal_topk(void) {
-    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 16383, 32767, 65535};
+    const uint32_t frontiers[] = {1024, 1025, 1535, 2047, 2048, 4095, 4096, 8191, 8192, 16383, 32767, 65535};
     const uint32_t counts[] = {1, 2, 31, 32, 33, 127, 128, 129};
     for (uint32_t ratio = 1; ratio <= 2; ratio++) {
     for (size_t fi = 0; fi < sizeof(frontiers) / sizeof(*frontiers); fi++) {
