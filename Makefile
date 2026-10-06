@@ -685,8 +685,11 @@ test-mxfp4-staged-cuda: tests/test_mxfp4_staged_cuda
 tests/test_mmvq_cuda: tests/test_mmvq.cu $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -std=c++17 $(MMQ_INCLUDES) -o $@ $^ $(CUDA_LDLIBS)
 
-tests/test_mmvq_rocm: tests/test_mmvq.cu $(ROCM_MMQ_OBJS)
-	$(HIPCC) $(ROCM_MMQ_FLAGS) -o $@ $^ $(ROCM_LDLIBS)
+tests/test_mmvq_rocm.o: tests/test_mmvq.cu cuda/mmq/ds4_mmq.h cuda/mmq/vendors/hip.h
+	$(HIPCC) $(ROCM_MMQ_FLAGS) -c -o $@ $<
+
+tests/test_mmvq_rocm: tests/test_mmvq_rocm.o $(ROCM_MMQ_OBJS)
+	$(HIPCC) $(ROCM_CFLAGS) -o $@ $^ $(ROCM_LDLIBS)
 
 .PHONY: test-mmvq-cuda test-mmvq-rocm
 test-mmvq-cuda: tests/test_mmvq_cuda

@@ -6,11 +6,13 @@
 #include <cstdlib>
 #include <vector>
 
+#ifndef GGML_USE_HIP
 extern "C" int ds4_cuda_q8_fold_take_q81(
         const void *, uint64_t, const void **q81) {
     if (q81) *q81 = nullptr;
     return 0;
 }
+#endif
 
 #define CHECK_CUDA(call) do { \
     cudaError_t err = (call); \
