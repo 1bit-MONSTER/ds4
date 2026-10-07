@@ -43,8 +43,9 @@
  * 18: VERIFY flags (verify-head vocab split), small exchange and head-row
  *     records in the slab tail.
  * 19: DSpark drafter agreement, draft commands and proposal-check flags.
- * 20: VERIFY_COMMIT uses the command mailbox when negotiated. */
-#define DS4_TP_PROTOCOL_VERSION 20u
+ * 20: VERIFY_COMMIT uses the command mailbox when negotiated.
+ * 21: SPEC_RESTORE restores a speculative prefix with a status-only ACK. */
+#define DS4_TP_PROTOCOL_VERSION 21u
 
 /* Leader -> worker command mailbox.  Command frames are written with RDMA
  * WRITE into a ring in the worker's slab and polled from host memory, so
@@ -3028,6 +3029,13 @@ int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos) {
                          &msg, sizeof(msg));
 }
 
+int ds4_tp_send_spec_restore(ds4_tp *tp, uint64_t session_id, int pos) {
+    if (pos < 0) return 0;
+    ds4_tp_value_command msg = { session_id, (int32_t)pos, 0 };
+    return tp_send_command(tp, DS4_TP_FRAME_SPEC_RESTORE,
+                         &msg, sizeof(msg));
+}
+
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id) {
     return tp_send_command(tp, DS4_TP_FRAME_INVALIDATE,
                          &session_id, sizeof(session_id));
@@ -3310,10 +3318,16 @@ int ds4_tp_recv_command(ds4_tp *tp, ds4_tp_command *command,
                                           err, errlen);
         break;
     case DS4_TP_FRAME_SESSION_CREATE:
-    case DS4_TP_FRAME_REWIND: {
+    case DS4_TP_FRAME_REWIND:
+    case DS4_TP_FRAME_SPEC_RESTORE: {
         ds4_tp_value_command msg;
         if (bytes != sizeof(msg)) { ok = 0; break; }
         memcpy(&msg, payload, sizeof(msg));
+        if (ftype == DS4_TP_FRAME_SPEC_RESTORE &&
+            (msg.value < 0 || msg.reserved != 0)) {
+            ok = 0;
+            break;
+        }
         command->session_id = msg.session_id;
         command->value = msg.value;
         break;
@@ -3846,6 +3860,17 @@ int ds4_tp_worker_run(ds4_engine *engine, const ds4_tp_options *opt) {
             }
         } else if (command.type == DS4_TP_FRAME_REWIND) {
             ds4_session_rewind(session, command.value);
+        } else if (command.type == DS4_TP_FRAME_SPEC_RESTORE) {
+            const int restore_rc =
+                ds4_session_restore_speculative_prefix(session, command.value);
+            if (!ds4_tp_send_command_ack(tp, command.session_id, restore_rc)) {
+                rc = 1;
+            } else if (restore_rc < 0) {
+                ds4_log(stderr, DS4_LOG_ERROR,
+                        "tp worker speculative prefix restore failed (status %d)",
+                        restore_rc);
+                rc = 1;
+            }
         } else if (command.type == DS4_TP_FRAME_INVALIDATE) {
             ds4_session_invalidate(session);
         } else if (command.type == DS4_TP_FRAME_EVAL_BATCH ||

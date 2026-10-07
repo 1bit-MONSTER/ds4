@@ -184,6 +184,10 @@ int ds4_tp_send_eval(ds4_tp *tp, uint64_t session_id,
 int ds4_tp_send_glm_mtp(ds4_tp *tp, uint64_t session_id,
                        uint64_t seq, int token, int limit);
 int ds4_tp_send_rewind(ds4_tp *tp, uint64_t session_id, int pos);
+/* State-only restore: ACK status 0 restored, 1 unavailable, -1 failed (closes).
+ * No TP collectives or logits reply. Await ds4_tp_wait_command_status() before
+ * mirroring replay EVALs; status 1 requires invalidation and full sync. */
+int ds4_tp_send_spec_restore(ds4_tp *tp, uint64_t session_id, int pos);
 int ds4_tp_send_invalidate(ds4_tp *tp, uint64_t session_id);
 int ds4_tp_send_eval_batch(ds4_tp *tp, const ds4_tp_batch_item *items,
                            uint32_t count);
@@ -230,6 +234,7 @@ typedef enum {
     DS4_TP_FRAME_GLM_MTP = 21,
     DS4_TP_FRAME_SYNC_CHECKPOINT = 22,
     DS4_TP_FRAME_DSPARK_DRAFT = 23,
+    DS4_TP_FRAME_SPEC_RESTORE = 24,
 } ds4_tp_frame_type;
 
 typedef struct {

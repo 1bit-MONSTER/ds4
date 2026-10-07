@@ -276,6 +276,62 @@ static void check_verify_commits(void) {
     puts("TP verify commits: all modes, ordering, malformed frames, EOF and timeout: ok");
 }
 
+/* Transport-only: supply the engine's three possible return statuses. */
+static void check_spec_restore(void) {
+    int fd[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
+    assert(tp_socket_set_gate_timeout(fd[0], 50));
+    assert(tp_socket_set_gate_timeout(fd[1], 50));
+    ds4_tp leader = {.control_fd = fd[0]}, worker = {.control_fd = fd[1]};
+    ds4_tp_command cmd;
+    char err[256];
+    const int positions[] = {0, 123, INT_MAX};
+    const int statuses[] = {0, 1, -1};
+    for (unsigned i = 0; i < sizeof(positions) / sizeof(positions[0]); i++) {
+        assert(ds4_tp_send_spec_restore(&leader, 42, positions[i]));
+        assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        assert(cmd.type == DS4_TP_FRAME_SPEC_RESTORE && cmd.session_id == 42 &&
+               cmd.value == positions[i]);
+        assert(cmd.seq == 0 && cmd.limit == 0 && cmd.n_tokens == 0 &&
+               cmd.n_items == 0 && cmd.n_images == 0);
+        ds4_tp_command_free(&cmd);
+        int status = 99;
+        assert(ds4_tp_send_command_ack(&worker, 42, statuses[i]));
+        assert(ds4_tp_wait_command_status(&leader, 42, &status,
+                                          "spec restore", err, sizeof(err)));
+        assert(status == statuses[i] && !ds4_tp_failed(&leader));
+        if (status == 0) {
+            assert(ds4_tp_send_eval(&leader, 42, i, 7));
+            assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+            assert(cmd.type == DS4_TP_FRAME_EVAL && cmd.session_id == 42 &&
+                   cmd.seq == i && cmd.value == 7);
+            ds4_tp_command_free(&cmd);
+        } else if (status == 1) {
+            assert(ds4_tp_send_invalidate(&leader, 42));
+            assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+            assert(cmd.type == DS4_TP_FRAME_INVALIDATE && cmd.session_id == 42);
+            ds4_tp_command_free(&cmd);
+        }
+    }
+    assert(!ds4_tp_send_spec_restore(&leader, 42, -1));
+    assert(!ds4_tp_send_spec_restore(&leader, 42, INT_MIN));
+    char byte;
+    assert(recv(fd[1], &byte, 1, MSG_DONTWAIT) == -1 &&
+           (errno == EAGAIN || errno == EWOULDBLOCK));
+    const ds4_tp_value_command bad[] = {{42, -1, 0}, {42, 0, 1}};
+    for (unsigned i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        assert(tp_send_frame(fd[0], DS4_TP_FRAME_SPEC_RESTORE, &bad[i], sizeof(bad[i])));
+        assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+        ds4_tp_command_free(&cmd);
+    }
+    const ds4_tp_value_command msg = {42, 123, 0};
+    assert(tp_send_frame(fd[0], DS4_TP_FRAME_SPEC_RESTORE, &msg, sizeof(msg) - 4u));
+    assert(!ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));
+    ds4_tp_command_free(&cmd);
+    close(fd[0]); close(fd[1]);
+    puts("TP spec restore: positions, status ACKs, command reuse and malformed frames: ok");
+}
+
 static void check_failed_link(void) {
     int fd[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, fd) == 0);
@@ -292,6 +348,7 @@ static void check_failed_link(void) {
         assert(!ds4_tp_send_verify(&tp, 1, &token, 1));
         assert(!ds4_tp_send_verify_commit(&tp, DS4_TP_VERIFY_ROLLBACK_REPLAY, 1));
         assert(!ds4_tp_send_dspark_draft(&tp, 1, token, 1, DS4_TP_DSPARK_DRAFT));
+        assert(!ds4_tp_send_spec_restore(&tp, 1, 0));
         assert(!ds4_tp_gate_exchange(&tp, 0, 0, 1));
         assert(!ds4_tp_batch_gate_exchange(&tp, 0, 2, 1));
         assert(!ds4_tp_big_gate_exchange(&tp, 0, 1, &out, &in, sizeof(out)));
@@ -342,6 +399,7 @@ int main(void) {
     check_sync_cancellation();
     check_logits_halves();
     check_verify_commits();
+    check_spec_restore();
     check_failed_link();
 #ifdef DS4_TP_HAVE_VERBS
     check_mailbox_verify_commits();
@@ -352,7 +410,8 @@ int main(void) {
     ds4_tp worker = { .control_fd = fd[1] };
     char err[256] = "";
     ds4_tp_command cmd;
-    assert(DS4_TP_PROTOCOL_VERSION == 20);
+    assert(DS4_TP_PROTOCOL_VERSION == 21);
+    assert(DS4_TP_FRAME_SPEC_RESTORE == 24);
     for (int i = 0; i < 4; i++) {
         assert(ds4_tp_send_eval(&leader, 42, 2*i, 100+i));
         assert(ds4_tp_recv_command(&worker, &cmd, err, sizeof(err)));

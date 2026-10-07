@@ -61027,6 +61027,11 @@ struct ds4_session {
     float *glm_mtp_hc;
     float *glm_mtp_logits0;
     ds4_spec_frontier greedy_splitkv_anchor;
+    ds4_spec_frontier dspark_rewind_frontier;
+    float *dspark_rewind_logits;
+    int dspark_rewind_start;
+    int dspark_rewind_end;
+    uint32_t dspark_rewind_prefixes;
 #endif
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
@@ -62025,6 +62030,7 @@ static bool ds4_session_is_ds41(const ds4_session *s) {
 static void ds4_session_dspark_capture_invalidate(ds4_session *s) {
 #ifndef DS4_NO_GPU
     if (!s) return;
+    s->dspark_rewind_end = 0;
     s->dspark_draft_valid = false;
     s->dspark_draft_len = 0;
     s->dspark_tp_proposal = false;
@@ -63048,6 +63054,7 @@ static bool spec_frontier_copy(const ds4_gpu_copy_span *spans, uint32_t n) {
 }
 
 static bool spec_frontier_snapshot(ds4_spec_frontier *f, ds4_session *s) {
+    s->dspark_rewind_end = 0;
     memset(f, 0, sizeof(*f));
     ds4_gpu_graph *g = &s->graph;
     if (!metal_graph_dspark_cache_current_window_valid(g)) return false;
@@ -63169,6 +63176,26 @@ static bool spec_frontier_commit_prefix(ds4_session *s, uint32_t prefix_len) {
 
 static bool spec_frontier_commit_prefix1(ds4_session *s) {
     return spec_frontier_commit_prefix(s, 1);
+}
+
+/* The snapshot buffers are session-owned and survive the verifier call. Keep
+ * their provenance until another operation changes the checkpoint or scratch. */
+static void dspark_rewind_begin(ds4_session *s, const ds4_spec_frontier *frontier,
+                                int start, int rows) {
+    s->dspark_rewind_end = 0;
+    s->dspark_rewind_frontier = *frontier;
+    s->dspark_rewind_start = start;
+    s->dspark_rewind_prefixes = (uint32_t)(rows - 1);
+    if (s->dspark_rewind_prefixes > DS4_SPEC_PREFIX_SLOTS)
+        s->dspark_rewind_prefixes = DS4_SPEC_PREFIX_SLOTS;
+    if (!s->dspark_rewind_logits)
+        s->dspark_rewind_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(float));
+    memcpy(s->dspark_rewind_logits, s->logits,
+           (size_t)DS4_N_VOCAB * sizeof(float));
+}
+
+static void dspark_rewind_keep(ds4_session *s) {
+    s->dspark_rewind_end = s->checkpoint.len;
 }
 
 static void session_greedy_splitkv_reset(ds4_session *s) {
@@ -74513,6 +74540,7 @@ void ds4_session_free(ds4_session *s) {
     free(s->mtp_logits);
 #ifndef DS4_NO_GPU
     free(s->spec_row_logits);
+    free(s->dspark_rewind_logits);
     free(s->dspark_markov_bias);
     free(s->dspark_conf_features);
 #endif
@@ -76268,6 +76296,9 @@ static int ds4_session_sync_lockstep(ds4_session *s, const ds4_tokens *prompt,
  * once its matching prefill completes, surfacing worker-side failures
  * here instead of as a gate timeout mid-decode. */
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen) {
+#ifndef DS4_NO_GPU
+    if (s) s->dspark_rewind_end = 0;
+#endif
     if (s && s->checkpoint_valid && !ds4_session_vision_prefix_matches(
                      s, s->sync_images, s->sync_image_count)) {
         ds4_session_invalidate(s);
@@ -78628,6 +78659,9 @@ static void ds4_session_prepare_support_draft(ds4_session *s,
 static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      char *err, size_t errlen) {
     if (!s) return 1;
+#ifndef DS4_NO_GPU
+    s->dspark_rewind_end = 0;
+#endif
     if (s->distributed) {
         if (!s->checkpoint_valid) {
             if (errlen) snprintf(err, errlen, "distributed decode requires a valid checkpoint");
@@ -81831,6 +81865,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
     if (stats_enabled) {
         s->dspark_stats.snapshot_ms += (now_sec() - snapshot_t0) * 1000.0;
     }
+    if (have_frontier) dspark_rewind_begin(s, &frontier, start, draft_n);
     bool ok = have_frontier && row_logits && (draft_n <= 1 || row_tops);
     bool verifier_may_have_mutated = false;
     bool tp_verify_sent = false;
@@ -81951,6 +81986,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                     draft_n,
                     n_accept);
         }
+        dspark_rewind_keep(s);
         spec_frontier_free(&frontier);
         if (getenv("DS4_DSPARK_CYCLE_TRACE") && stats_enabled)
             fprintf(stderr, "ds4: DSpark cycle: direct-full commit, total since entry %.1f ms\n", (now_sec() - stats_t0) * 1000.0);
@@ -82026,6 +82062,7 @@ static int ds4_session_eval_dspark_speculative_argmax(
                         emitted_drafts,
                         n_accept);
             }
+            dspark_rewind_keep(s);
             spec_frontier_free(&frontier);
             if (getenv("DS4_DSPARK_CYCLE_TRACE") && stats_enabled)
                 fprintf(stderr, "ds4: DSpark cycle: direct-partial commit %d, total since entry %.1f ms\n", commit_drafts, (now_sec() - stats_t0) * 1000.0);
@@ -82385,6 +82422,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
     int row_tops[DS4_DSPARK_MAX_BLOCK_SIZE];
     const int start = s->checkpoint.len;
     bool have_frontier = spec_frontier_snapshot(&frontier, s);
+    if (have_frontier) dspark_rewind_begin(s, &frontier, start, draft_n);
     bool ok = have_frontier && s->spec_row_logits;
     bool verifier_may_have_mutated = false;
     bool tp_verify_sent = false;
@@ -82473,6 +82511,7 @@ static int ds4_session_eval_dspark_speculative_stochastic(
             ds4_session_dspark_scheduler_note(
                 s, (uint32_t)emitted, false,
                 DS4_DSPARK_STOCH_EXTRA_MS());
+            dspark_rewind_keep(s);
             spec_frontier_free(&frontier);
             DS4_DSPARK_STOCH_FINISH();
             return n_accept;
@@ -82648,6 +82687,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         snprintf(err, errlen, "tp: frontier snapshot failed");
         return 1;
     }
+    dspark_rewind_begin(s, &frontier, start, draft_n);
     const bool head_split = (flags & DS4_TP_VERIFY_HEAD_SPLIT) != 0;
     if (head_split &&
         (!ds4_tp_command_mailbox_active(e->tp.ctx) ||
@@ -82724,6 +82764,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         }
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        dspark_rewind_keep(s);
         return 0;
     }
     if (commit_mode == DS4_TP_VERIFY_COMMIT_PREFIX) {
@@ -82761,6 +82802,7 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         }
         s->checkpoint_valid = true;
         ds4_session_dspark_capture_note_checkpoint(s);
+        dspark_rewind_keep(s);
         spec_frontier_free(&frontier);
         return 0;
     }
@@ -86680,10 +86722,110 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
+/* Internal state-only restore. The coordinator must replay from this prefix
+ * before sampling; the TP worker acknowledges it before any gated eval. */
+int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)pos;
+    return 1;
+#else
+    if (!s || !s->checkpoint_valid || !s->dspark_rewind_logits ||
+        s->dspark_rewind_end <= s->dspark_rewind_start ||
+        s->dspark_rewind_end != s->checkpoint.len ||
+        pos < s->dspark_rewind_start || pos >= s->dspark_rewind_end ||
+        (uint32_t)(pos - s->dspark_rewind_start) > s->dspark_rewind_prefixes)
+        return 1;
+    const uint32_t prefix = (uint32_t)(pos - s->dspark_rewind_start);
+    ds4_session_dspark_capture_invalidate(s);
+    /* Restore the drafter window too; verifier-prefix snapshots contain only
+     * target compressor states. Later proposals reset any discontinuous history. */
+    bool ok = spec_frontier_restore(&s->dspark_rewind_frontier, s);
+    if (ok && prefix) ok = spec_frontier_commit_prefix(s, prefix);
+    if (!ok) {
+        s->checkpoint_valid = false;
+        return -1;
+    }
+    s->checkpoint.len = pos;
+    s->mtp_draft_valid = false;
+    s->dspark_stochastic_draft = false;
+    if (prefix == 0) {
+        memcpy(s->logits, s->dspark_rewind_logits,
+               (size_t)DS4_N_VOCAB * sizeof(float));
+    }
+    return 0;
+#endif
+}
+
+#ifndef DS4_NO_GPU
+/* Recover a recent boundary with at most one verifier block of replay. Keep
+ * the old invalidation/rebuild contract for arbitrary or stale rewinds. */
+static bool dspark_rewind_recent(ds4_session *s, int pos) {
+    if (!s->checkpoint_valid || !s->dspark_rewind_logits ||
+        s->dspark_rewind_end <= s->dspark_rewind_start ||
+        s->dspark_rewind_end != s->checkpoint.len ||
+        pos < s->dspark_rewind_start || pos >= s->dspark_rewind_end ||
+        s->checkpoint.len - s->dspark_rewind_start > DS4_DSPARK_MAX_BLOCK_SIZE ||
+        (s->engine->tp.active && !ds4_session_tp_leader(s))) return false;
+
+    const int start = s->dspark_rewind_start;
+    int base = pos == start ? start : pos - 1;
+    if (base - start > (int)s->dspark_rewind_prefixes)
+        base = start + (int)s->dspark_rewind_prefixes;
+    const int replay = pos - base;
+    int tokens[DS4_DSPARK_MAX_BLOCK_SIZE];
+    memcpy(tokens, s->checkpoint.v + base, (size_t)replay * sizeof(int));
+    ds4_engine *e = s->engine;
+    const bool mirror = ds4_session_tp_leader(s);
+    char err[160] = {0};
+    if (mirror && !ds4_tp_send_spec_restore(e->tp.ctx, s->tp_session_id, base)) {
+        s->checkpoint_valid = false;
+        return false;
+    }
+    const int local_status = ds4_session_restore_speculative_prefix(s, base);
+    int worker_status = 0;
+    if (mirror && !ds4_tp_wait_command_status(e->tp.ctx, s->tp_session_id,
+                                             &worker_status, "speculative restore",
+                                             err, sizeof(err))) worker_status = -1;
+    /* A negative worker status is terminal: the peer exits after its ACK. */
+    if (mirror && worker_status < 0) ds4_tp_mark_failed(e->tp.ctx);
+    if (local_status != 0 || worker_status != 0) {
+        /* Either peer may have restored already. Invalidate both before the
+         * caller falls back to rebuilding, keeping its retained token list. */
+        if (mirror && !ds4_tp_failed(e->tp.ctx))
+            (void)ds4_tp_send_invalidate(e->tp.ctx, s->tp_session_id);
+        s->checkpoint.len = pos;
+        s->checkpoint_valid = false;
+        s->dspark_rewind_end = 0;
+        return false;
+    }
+    for (int i = 0; i < replay; i++) {
+        if (ds4_session_eval_probe_tp(s, tokens[i], false, err, sizeof(err)) != 0) {
+            s->checkpoint.len = pos;
+            s->checkpoint_valid = false;
+            return false;
+        }
+    }
+    if (getenv("DS4_DSPARK_SPEC_LOG"))
+        fprintf(stderr, "ds4: DSpark boundary restore pos=%d base=%d replay=%d\n",
+                pos, base, replay);
+    return true;
+}
+#endif
+
+bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
+#ifdef DS4_NO_GPU
+    (void)s; (void)pos;
+    return false;
+#else
+    return s && s->engine && pos >= 0 && dspark_rewind_recent(s, pos);
+#endif
+}
+
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
     if (pos >= s->checkpoint.len) return;
+    if (ds4_session_rewind_speculative(s, pos)) return;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         if (!ds4_tp_send_rewind(s->engine->tp.ctx, s->tp_session_id, pos))

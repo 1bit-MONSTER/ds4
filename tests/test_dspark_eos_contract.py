@@ -59,6 +59,7 @@ PRELUDE = r'''
 #define DS4_TP_VERIFY_DSPARK_SEED 4u
 #define HAVE_TP_FLAGS FIXTURE_TP_FLAGS
 #define HAVE_HEAD_SPLIT FIXTURE_HEAD_SPLIT
+#define HAVE_REWIND FIXTURE_REWIND
 enum { DS4_BACKEND_METAL, DS4_BACKEND_CUDA, DS4_BACKEND_CPU };
 typedef int ds4_think_mode;
 typedef struct { int len, data[64]; } ds4_tokens;
@@ -121,6 +122,15 @@ static void spec_frontier_free(ds4_spec_frontier *f) { (void)f; }
 static bool spec_frontier_restore(ds4_spec_frontier *f,ds4_session *s) {
     s->graph.frontier=f->frontier; return true;
 }
+#if HAVE_REWIND
+static void dspark_rewind_begin(ds4_session *s,const ds4_spec_frontier *f,int start,int rows) {
+    if(s!=active_session || f->frontier!=start || s->checkpoint.len!=start ||
+       rows<1 || rows>DS4_DSPARK_MAX_BLOCK_SIZE) mock_errors++;
+}
+static void dspark_rewind_keep(ds4_session *s) {
+    if(s!=active_session || !s->checkpoint_valid || s->checkpoint.len!=s->graph.frontier) mock_errors++;
+}
+#endif
 static bool ds4_session_tp_leader(ds4_session *s) { (void)s; return tp_leader; }
 #if HAVE_TP_FLAGS
 static inline bool dspark_tp_block_matches(uint32_t,const int *,int,bool,const int *,uint32_t);
@@ -558,7 +568,8 @@ def main():
                              ('double ' if f.endswith('_ms') else 'uint64_t ') + f + ';' for f in fields)
     prelude = (PRELUDE.replace('STATS_FIELDS', declarations)
                .replace('FIXTURE_TP_FLAGS', str(int(tp_flags)))
-               .replace('FIXTURE_HEAD_SPLIT', str(int(head_split))))
+               .replace('FIXTURE_HEAD_SPLIT', str(int(head_split)))
+               .replace('FIXTURE_REWIND', str(int('dspark_rewind_begin(' in function))))
     code = '\n'.join([prelude, *helpers.values(), function, TESTS])
     compiler = shlex.split(os.environ.get('CC', 'cc'))
     if not compiler:

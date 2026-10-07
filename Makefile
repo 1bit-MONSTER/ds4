@@ -625,6 +625,8 @@ test-cuda-dspark-tp: tests/test_cuda_dspark_tp_markov tests/test_cuda_dspark_tp_
 test-dspark-history:
 	python3 tests/test_dspark_window.py
 	python3 tests/test_dspark_confidence_input.py
+	python3 tests/test_dspark_eos_contract.py
+	python3 tests/test_dspark_rewind.py
 
 tests/test_cuda_topk_stream.o: tests/test_cuda_topk_stream.cu ds4_gpu.h ds4_deepseek41_gpu.h
 	$(NVCC) $(NVCCFLAGS) -std=c++17 -I. -c -o $@ $<
